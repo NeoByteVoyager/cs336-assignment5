@@ -11,7 +11,7 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_rewar
 def load():
     tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-2-0425-1B")
     model = AutoModelForCausalLM.from_pretrained("allenai/OLMo-2-0425-1B", device_map="auto")
-    pipe = pipeline("text-generation", model="allenai/OLMo-2-0425-1B")
+    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
 
     config = deepcopy(model.generation_config)
     config.max_length = None
@@ -23,7 +23,7 @@ def load():
     config.stop_strings = ["</answer>"]
     return pipe, config, model, tokenizer
 
-def inference(pipe, config, tokenizer, prompt_path, data_path, is_r1):
+def inference(pipe, config, tokenizer, prompt_path, data_path, is_r1, question_num):
     template = Path(
         prompt_path
     ).read_text()
@@ -56,12 +56,13 @@ def inference(pipe, config, tokenizer, prompt_path, data_path, is_r1):
             print("reward: ", reward["reward"])
             print("-" * 80)
             i += 1
-            if i >= 10:
+            if i >= question_num:
                 break
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt_path", type=str)
+    parser.add_argument("--question_num", type=int)
     args = parser.parse_args()
 
     pipe, config, model, tokenizer = load()
@@ -75,5 +76,5 @@ if __name__ == "__main__":
         is_r1 = False
     else:
         is_r1 = True
-    inference(pipe, config, tokenizer, args.prompt_path, data_path, is_r1)
+    inference(pipe, config, tokenizer, args.prompt_path, data_path, is_r1, args.question_num)
 
