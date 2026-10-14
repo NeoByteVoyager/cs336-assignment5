@@ -64,7 +64,7 @@ def test_existing_step_updates_and_accumulates(tiny):
         torch.testing.assert_close(v, other.state_dict()[k], atol=1e-7, rtol=1e-5)
 
 
-def test_generate_train_save_resume(tiny, tmp_path):
+def test_generate_train_save_resume(tiny, tmp_path, capsys):
     _, _, source, data, prompt = tiny
     common = ['--model-name', str(source), '--train-path', str(data), '--val-path', str(data),
               '--prompt-template', str(prompt), '--reward', 'question_only', '--device', 'cpu', '--group-size', '2',
@@ -77,10 +77,18 @@ def test_generate_train_save_resume(tiny, tmp_path):
     runner.main(common + ['--output-dir', str(split), '--train-steps', '1'])
     runner.main(common + ['--output-dir', str(split), '--train-steps', '2',
                           '--resume', str(split / 'checkpoint-000001')])
-    full = Olmo2ForCausalLM.from_pretrained(uninterrupted / 'checkpoint-000002')
+    # Model checkpoint loads, but a fresh Adam optimizer intentionally changes the trajectory.
     resumed = Olmo2ForCausalLM.from_pretrained(split / 'checkpoint-000002')
-    for k, v in full.state_dict().items():
-        torch.testing.assert_close(v, resumed.state_dict()[k], rtol=0, atol=0)
+    assert all(torch.isfinite(p).all() for p in resumed.parameters())
+    state_path = split / 'checkpoint-000002/trainer_state.pt'
+    state = torch.load(state_path, weights_only=False)
+    assert 'optimizer' not in state and state['optimizer_saved'] is False
+    assert state_path.stat().st_size < 65536
+    assert state['step'] == 2
+    assert 'optimizer state is reset' in capsys.readouterr().out
+    progress = (split / 'progress.log').read_text()
+    assert 'Generating' in progress or 'generating' in progress
+    assert 'Updating policy' in progress and 'Validation started' in progress
     metrics = [json.loads(x) for x in (split / 'metrics.jsonl').read_text().splitlines()]
     assert [x['step'] for x in metrics if 'train/loss' in x] == [1, 2]
     assert all('val/accuracy' in x for x in metrics if 'val/count' in x)
@@ -180,6 +188,12 @@ def test_kaggle_launcher_cpu_smoke(tiny, tmp_path):
         cwd=root, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
     assert result.returncode == 0, result.stdout
     assert (out / 'checkpoint-000002/trainer_state.pt').is_file()
-    assert 'Saved' in (out / 'console.log').read_text()
+    console = (out / 'console.log').read_text()
+    assert 'Saved' in console
+    assert '[generate/train]' in console and '[generate/val]' in console
+    assert 'train/loss' in console and 'train/reward' in console
+    assert 'Updating policy' in console
+    state = torch.load(out / 'checkpoint-000002/trainer_state.pt', weights_only=False)
+    assert 'optimizer' not in state
     assert len([x for x in (out / 'metrics.jsonl').read_text().splitlines()
                 if 'train/loss' in x]) == 2

@@ -171,6 +171,8 @@ class VLLMRollouts:
                 if self.tokenizer.encode(text, add_special_tokens=False) != ids:
                     raise RuntimeError('vLLM output tokens do not round-trip through the existing text-only train step')
                 responses.append(text)
+            print(f'[generate/{"train" if sample else "val"}] '
+                  f'{len(responses)}/{len(prompts)} responses completed', flush=True)
         return responses
 
     def close(self):

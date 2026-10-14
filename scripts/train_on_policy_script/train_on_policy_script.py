@@ -40,7 +40,7 @@ def parse_args(argv=None):
     p.add_argument('--prompt-template', default=str(Path(__file__).resolve().parents[2] / 'cs336_alignment/prompts/r1_zero.prompt'), help='UTF-8 file, Python format with {question}; escape literal braces as {{ }}')
     p.add_argument('--reward', choices=['question_only', 'r1_zero'], default='r1_zero')
     p.add_argument('--output-dir', default='runs/grpo')
-    p.add_argument('--resume', help='checkpoint directory created by this script (trusted files only)')
+    p.add_argument('--resume', help='resume model/step from a trusted checkpoint; optimizer state starts fresh')
     p.add_argument('--device', choices=['cuda', 'cpu'], default='cuda')
     p.add_argument('--train-gpu', type=int, default=0)
     p.add_argument('--rollout-gpu', type=int, default=1, help='-1: share training GPU; default: second GPU')
@@ -171,6 +171,8 @@ def generate_responses(model, tokenizer, prompts, args, *, sample):
                                        'Existing utils.tokenize_prompt_and_output only accepts strings; '
                                        'cannot score this rollout faithfully without changing that interface.')
                 responses.append(response)
+            print(f'[generate/{"train" if sample else "val"}] '
+                  f'{len(responses)}/{len(prompts)} responses completed', flush=True)
     return responses
 
 
@@ -201,6 +203,12 @@ class Logger:
         print(json.dumps(event, ensure_ascii=False), flush=True)
         if self.run:
             self.run.log(event, step=event['step'])
+
+    def progress(self, step, message):
+        line = f'[step {step}] {message}'
+        print(line, flush=True)
+        with (self.root / 'progress.log').open('a', encoding='utf-8') as f:
+            f.write(line + '\n')
 
     def samples(self, kind, step, prompts, responses, truths, count):
         rows = [dict(kind=kind, step=step, prompt=p, response=r, ground_truth=t)
@@ -254,6 +262,7 @@ def token_entropy(model, tokenizer, prompts, responses):
 
 def evaluate(rollouts, tokenizer, records, args, reward_fn, step, logger):
     prompts, truths = expand_group(records[:args.eval_size], 1)
+    logger.progress(step, f'Validation started: {len(prompts)} questions')
     devices = list(range(torch.cuda.device_count())) if args.device == 'cuda' else []
     with torch.random.fork_rng(devices=devices):
         responses = rollouts.generate(prompts, sample=False, step=step)
@@ -271,14 +280,14 @@ def checkpoint_plan(model, args):
     remove = old[:max(0, len(old) - args.keep_checkpoints + 1)] if args.keep_checkpoints else []
     reclaimable = sum(f.stat().st_size for p in remove for f in p.rglob('*') if f.is_file())
     weights = sum(p.numel() * p.element_size() for p in model.parameters())
-    expected = weights * (3 if args.optimizer == 'adamw_cpu' else 1) + 128 * 2**20
+    expected = weights + 128 * 2**20  # model + tokenizer + small RNG/config metadata only
     if shutil.disk_usage(root).free + reclaimable < expected:
         raise OSError(f'Insufficient checkpoint disk space: need about {expected / 2**30:.2f} GiB '
                       '(after configured checkpoint retention). Free space or choose another output directory.')
     return remove
 
 
-def save_checkpoint(model, tokenizer, optimizer, sampler, args, config, step):
+def save_checkpoint(model, tokenizer, sampler, args, config, step):
     root = Path(args.output_dir)
     destination = root / f'checkpoint-{step:06d}'
     temporary = root / f'.checkpoint-{step:06d}.incomplete'
@@ -291,7 +300,7 @@ def save_checkpoint(model, tokenizer, optimizer, sampler, args, config, step):
     temporary.mkdir(exist_ok=False)
     model.save_pretrained(temporary)
     tokenizer.save_pretrained(temporary)
-    torch.save({'step': step, 'optimizer': optimizer.state_dict(),
+    torch.save({'step': step, 'optimizer_saved': False,
                 'sampler_rng': sampler.getstate(), 'torch_rng': torch.get_rng_state(),
                 'cuda_rng': torch.cuda.get_rng_state_all() if args.device == 'cuda' else None,
                 'config': config}, temporary / 'trainer_state.pt')
@@ -359,7 +368,7 @@ def main(argv=None):
     optimizer.zero_grad(set_to_none=True)
     start = 0
     if state:
-        optimizer.load_state_dict(state['optimizer'])
+        print('Resuming model weights and step; optimizer state is reset (not restored).', flush=True)
         sampler.setstate(state['sampler_rng'])
         torch.set_rng_state(state['torch_rng'])
         if state['cuda_rng'] is not None:
@@ -392,6 +401,7 @@ def main(argv=None):
 
 def run_training(model, tokenizer, optimizer, sampler, train, val, args, config,
                  reward_fn, start, logger, rollouts):
+    logger.progress(start, 'Synchronizing rollout model for initial validation')
     rollouts.sync()
     evaluate(rollouts, tokenizer, val, args, reward_fn, start, logger)
     for step in range(start + 1, args.train_steps + 1):
@@ -401,10 +411,17 @@ def run_training(model, tokenizer, optimizer, sampler, train, val, args, config,
                 torch.cuda.reset_peak_memory_stats(gpu)
         selected = sampler.sample(train, args.prompts_per_step)
         prompts, truths = expand_group(selected, args.group_size)
+        logger.progress(step, f'Start {step}/{args.train_steps}: syncing weights, then generating {len(prompts)} responses')
         rollouts.sync()
         responses = rollouts.generate(prompts, sample=True, step=step)
         scores = score_responses(responses, truths, reward_fn)
-        entropy = token_entropy(model, tokenizer, prompts, responses) if step % args.entropy_every == 0 else None
+        logger.progress(step, f'Rollout completed: reward={scores["reward"]:.4f}, format_reward={scores["format_reward"]:.4f}')
+        if step % args.entropy_every == 0:
+            logger.progress(step, 'Computing response-token entropy')
+            entropy = token_entropy(model, tokenizer, prompts, responses)
+        else:
+            entropy = None
+        logger.progress(step, f'Updating policy: {args.gradient_accumulation_steps} microbatches, optimizer={args.optimizer}')
         model.train()
         # Exactly one call/update per fresh rollout. Accumulation is internal.
         loss, _ = grpo_train_step(
@@ -431,10 +448,12 @@ def run_training(model, tokenizer, optimizer, sampler, train, val, args, config,
         logger.write(event)
         logger.samples('train', step, prompts, responses, truths, args.log_samples)
         if step % args.eval_every == 0 or step == args.train_steps:
+            logger.progress(step, 'Policy updated; syncing weights for validation')
             rollouts.sync()
             evaluate(rollouts, tokenizer, val, args, reward_fn, step, logger)
         if step % args.save_every == 0 or step == args.train_steps:
-            save_checkpoint(model, tokenizer, optimizer, sampler, args, config, step)
+            logger.progress(step, 'Saving model/tokenizer checkpoint (without optimizer state)')
+            save_checkpoint(model, tokenizer, sampler, args, config, step)
 
 
 if __name__ == '__main__':

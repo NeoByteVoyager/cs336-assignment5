@@ -136,16 +136,17 @@ assignment 仍用微批次 1，而不是 PDF 的微批次 8；保持每步回答
 
 输出目录：
 
-- `console.log`：wrapper 捕获 stdout/stderr，含 traceback。
+- `console.log`：wrapper 捕获 stdout/stderr，含 traceback。终端会实时打印阶段进度、每批生成完成数量，以及每步 loss/reward/grad norm 等指标。
+- `progress.log`：训练脚本直接记录同步、生成、entropy、更新、验证和保存阶段，即使不通过 wrapper 启动也会写入。
 - `metrics.jsonl`：train loss、裁剪前 grad norm、原策略 response-token entropy、total/format reward、回答 token 长度、步耗时；val accuracy、total/format reward、回答长度、题数。
 - `samples.jsonl`：prompt、response、ground_truth、step 和 train/val 类型，`--log-samples` 控制每次条数。
 - `config-from-step-*.json`：参数、模板文本、数据 SHA256。
-- `checkpoint-NNNNNN/`：HF 权重/tokenizer 和 `trainer_state.pt`，包含 CPU Adam 状态、步数、数据采样器和 torch/CUDA RNG。
+- `checkpoint-NNNNNN/`：HF 权重/tokenizer 和很小的 `trainer_state.pt`，只保存步数、配置、数据采样器和 torch/CUDA RNG，**不保存优化器状态**。
 
 entropy 默认每步在更新前用已有 `get_reponse_log_probs(return_token_entropy=True)` 做额外无梯度前向，按所有回答的有效 token 求平均。有额外计算成本，`--entropy-every 10` 可降低记录频率。
 GPU 显存指标只统计当前训练进程的 PyTorch allocator；vLLM 独立 server 占用需看 nvidia-smi，不要用训练进程的 GPU 1 指标估算 server 峰值。
 
-checkpoint 体积很大：全量 FP32 权重约 5.53 GiB，Adam 状态约 11.06 GiB，合计约 **16.60 GiB**，还需 tokenizer/序列化开销。模型下载缓存另外占磁盘，运行前检查 `!df -h /kaggle/working`。wrapper 在 `/kaggle/temp` 存在且未设置 HF_HOME 时，将下载缓存放在那里；临时缓存不作为 Notebook 输出保留。脚本会在首次 rollout 前及每次保存前检查预计 checkpoint 空间，不足时明确报错。
+checkpoint 不再保存 Adam 状态：全量 FP32 权重约 **5.53 GiB**，加 tokenizer 和少量训练元数据，保存前的空间检查约为 **5.66 GiB**。此修改只降低磁盘占用，不改变训练期间显存和 CPU 内存需求。模型下载缓存另外占磁盘，运行前检查 `!df -h /kaggle/working`。wrapper 在 `/kaggle/temp` 存在且未设置 HF_HOME 时，将下载缓存放在那里；临时缓存不作为 Notebook 输出保留。脚本会在首次 rollout 前及每次保存前检查预计 checkpoint 空间，不足时明确报错。
 默认 `--keep-checkpoints 1`：**先删除旧完整 checkpoint 再保存新 checkpoint**，控制磁盘峰值；保存期间故障可能失去上一份，因此重要实验请先备份到外部存储。
 `--keep-checkpoints 0` 保留全部；`2` 保留两份，但峰值、长期配额需要相应增加。不会删除 `.incomplete` 半成品或覆盖同名 checkpoint。
 日志一直追加，不受 checkpoint 清理影响。保存过程不完成时目录保持 `.incomplete`，不要用它恢复。
@@ -158,7 +159,7 @@ checkpoint 体积很大：全量 FP32 权重约 5.53 GiB，Adam 状态约 11.06 
 
 自定义模板/数据路径、学习率、采样配置都必须与原运行一致（文件路径可变，但内容指纹须相同）；可改总步数、日志/保存频率、输出目录。
 恢复旧 checkpoint 时建议换输出目录，避免已经存在的同名 checkpoint。只加载自己信任的 trainer_state（使用 torch pickle）。
-CPU 小模型已验证连续/恢复训练权重逐位一致；GPU 非确定性和跨版本数值差异仍可能影响轨迹。vLLM 每次请求按 seed、step 和批次索引设随机种子，未承诺跨硬件逐位一致。
+**恢复时加载模型、步数和随机数状态，但 Adam 的动量与步数重新初始化，终端会明确提示；因此恢复后的轨迹不与不中断训练逐位一致。** CPU 小模型已验证轻量 checkpoint 可加载并继续训练。vLLM 每次请求按 seed、step 和批次索引设随机种子，未承诺跨硬件逐位一致。
 
 可选 wandb：先 `%pip install wandb`，通过 Kaggle Secret 设置 `WANDB_API_KEY` 或自行登录，然后添加 `--wandb-project PROJECT --wandb-name NAME`；本地日志始终写入。
 
