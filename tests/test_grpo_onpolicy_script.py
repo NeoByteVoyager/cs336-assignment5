@@ -197,3 +197,64 @@ def test_kaggle_launcher_cpu_smoke(tiny, tmp_path):
     assert 'optimizer' not in state
     assert len([x for x in (out / 'metrics.jsonl').read_text().splitlines()
                 if 'train/loss' in x]) == 2
+
+
+def test_noncanonical_generation_preserves_sampled_ids(tiny):
+    """Same decoded text, different actions: no text-keyed cache or re-encoding."""
+    from tokenizers.models import WordPiece
+    from tokenizers.decoders import WordPiece as WordPieceDecoder
+    from transformers import GenerationConfig
+    vocab = {'[UNK]': 0, '[PAD]': 1, '[EOS]': 2, 'a': 3, '##b': 4,
+             'ab': 5, 'Q': 6, '2': 7, 'A': 8}
+    backend = Tokenizer(WordPiece(vocab, unk_token='[UNK]'))
+    backend.pre_tokenizer = WhitespaceSplit()
+    backend.decoder = WordPieceDecoder(prefix='##')
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token='[UNK]',
+                                        pad_token='[PAD]', eos_token='[EOS]')
+
+    class FixedSampler(torch.nn.Module):
+        def __init__(self, token_rows=None):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(1))
+            self.generation_config = GenerationConfig()
+            self.token_rows = token_rows or [[3, 4, 2], [5, 2, 1]]
+
+        def generate(self, input_ids, **kwargs):
+            return torch.cat((input_ids, input_ids.new_tensor(self.token_rows)), dim=1)
+
+    args = runner.parse_args(['--device', 'cpu', '--reward', 'question_only'])
+    responses = runner.generate_responses(FixedSampler(), tokenizer, ['Q', 'Q'], args, sample=False)
+    assert str(responses[0]) == str(responses[1])
+    assert responses[0].token_ids == (3, 4, 2)
+    assert responses[1].token_ids == (5, 2)  # EOS retained, post-EOS padding removed.
+    assert tokenizer.encode(responses[0], add_special_tokens=False) != list(responses[0].token_ids)
+    adapter = runner.RolloutTokenizer(tokenizer)
+    batch = runner.tokenize_prompt_and_output(['Q', 'Q'], responses, adapter)
+    assert batch['labels'].tolist() == [[3, 4, 2], [5, 2, 1]]
+    assert batch['response_mask'].tolist() == [[True, True, True], [True, True, False]]
+    assert runner.response_lengths(tokenizer, responses) == [3, 2]
+    # JSON samples are readable strings, not an unserializable metadata object.
+    assert json.loads(json.dumps(responses)) == [str(x) for x in responses]
+    import copy
+    assert copy.deepcopy(responses[0]).token_ids == (3, 4, 2)
+    assert adapter.encode('Q', add_special_tokens=False) == [6]
+    with pytest.raises(ValueError, match='add_special_tokens=False'):
+        adapter.encode(responses[0])
+    model, *_ = tiny
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    # Exercise the user's unmodified train step with a non-round-tripping response.
+    other = runner.TokenizedResponse('a', [3])
+    before = next(model.parameters()).detach().clone()
+    def reward(response, truth):
+        value = float(response == responses[0])
+        return {'reward': value, 'format_reward': value}
+    loss, _ = runner.grpo_train_step(model, adapter, optimizer, 2, 1.0,
+                                     reward, ['Q', 'Q'], [responses[0], other], ['2', '2'], 2)
+    assert torch.isfinite(loss)
+    assert not torch.equal(before, next(model.parameters()))
+    assert torch.isfinite(torch.tensor(runner.token_entropy(model, adapter, ['Q'], [responses[0]])))
+    # String stopping can finish a batch row without EOS; post-stop padding is not an action.
+    args.stop_string = 'ab'
+    stopped = runner.generate_responses(FixedSampler([[3, 4, 1], [5, 1, 1]]),
+                                       tokenizer, ['Q', 'Q'], args, sample=False)
+    assert [r.token_ids for r in stopped] == [(3, 4), (5,)]

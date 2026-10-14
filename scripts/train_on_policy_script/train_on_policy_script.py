@@ -24,7 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from cs336_alignment.drgrpo_grader import question_only_reward_fn, r1_zero_reward_fn
 from cs336_alignment.onpolicy_grpo.grpo_components import grpo_train_step
 from cs336_alignment.onpolicy_grpo.utils import tokenize_prompt_and_output, get_reponse_log_probs
-from scripts.train_on_policy_script.grpo_runtime import TrainingOptimizer, TransformersRollouts, VLLMRollouts
+from scripts.train_on_policy_script.grpo_runtime import (
+    TrainingOptimizer, TransformersRollouts, VLLMRollouts, TokenizedResponse, RolloutTokenizer,
+)
 
 DEFAULT_PROMPT = (
     'Solve the following problem step by step. End with your final answer in '
@@ -126,8 +128,8 @@ def load_records(path, template, tokenizer, max_prompt_tokens):
 def generate_responses(model, tokenizer, prompts, args, *, sample):
     """Small left-padded generation batches on the rollout GPU.
 
-    Preserve EOS and check decode/encode identity because the existing train step
-    accepts strings rather than generated token IDs. Never silently change actions.
+    Preserve sampled IDs, including EOS, alongside decoded display/reward text.
+    The training tokenizer adapter reads those IDs without re-tokenizing text.
     """
     model.eval()
     config = deepcopy(model.generation_config)
@@ -166,11 +168,13 @@ def generate_responses(model, tokenizer, prompts, args, *, sample):
                 if tokenizer.eos_token_id in generated:
                     generated = generated[:generated.index(tokenizer.eos_token_id) + 1]
                 response = tokenizer.decode(generated, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-                if not generated or tokenizer.encode(response, add_special_tokens=False) != generated:
-                    raise RuntimeError('Generated tokens do not round-trip through text. '
-                                       'Existing utils.tokenize_prompt_and_output only accepts strings; '
-                                       'cannot score this rollout faithfully without changing that interface.')
-                responses.append(response)
+                # String-based stopping may append batch padding without an EOS.
+                if (tokenizer.eos_token_id not in generated and args.stop_string
+                        and args.stop_string in response):
+                    while generated and generated[-1] == tokenizer.pad_token_id:
+                        generated.pop()
+                    response = tokenizer.decode(generated, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                responses.append(TokenizedResponse(response, generated))
             print(f'[generate/{"train" if sample else "val"}] '
                   f'{len(responses)}/{len(prompts)} responses completed', flush=True)
     return responses
@@ -239,7 +243,8 @@ def make_reward_fn(tokenizer, kind):
 
 
 def response_lengths(tokenizer, responses):
-    return [len(tokenizer.encode(r, add_special_tokens=False)) for r in responses]
+    return [len(r.token_ids) if isinstance(r, TokenizedResponse)
+            else len(tokenizer.encode(r, add_special_tokens=False)) for r in responses]
 
 
 @torch.no_grad()
@@ -401,6 +406,7 @@ def main(argv=None):
 
 def run_training(model, tokenizer, optimizer, sampler, train, val, args, config,
                  reward_fn, start, logger, rollouts):
+    training_tokenizer = RolloutTokenizer(tokenizer)
     logger.progress(start, 'Synchronizing rollout model for initial validation')
     rollouts.sync()
     evaluate(rollouts, tokenizer, val, args, reward_fn, start, logger)
@@ -418,14 +424,14 @@ def run_training(model, tokenizer, optimizer, sampler, train, val, args, config,
         logger.progress(step, f'Rollout completed: reward={scores["reward"]:.4f}, format_reward={scores["format_reward"]:.4f}')
         if step % args.entropy_every == 0:
             logger.progress(step, 'Computing response-token entropy')
-            entropy = token_entropy(model, tokenizer, prompts, responses)
+            entropy = token_entropy(model, training_tokenizer, prompts, responses)
         else:
             entropy = None
         logger.progress(step, f'Updating policy: {args.gradient_accumulation_steps} microbatches, optimizer={args.optimizer}')
         model.train()
         # Exactly one call/update per fresh rollout. Accumulation is internal.
         loss, _ = grpo_train_step(
-            model=model, tokenizer=tokenizer, optimizer=optimizer,
+            model=model, tokenizer=training_tokenizer, optimizer=optimizer,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             max_grad_norm=None, reward_fn=reward_fn,  # adapter clips/logs immediately before update
             repeated_prompts=prompts, rollout_responses=responses,

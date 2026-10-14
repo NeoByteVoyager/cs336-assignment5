@@ -168,7 +168,7 @@ checkpoint 不再保存 Adam 状态：全量 FP32 权重约 **5.53 GiB**，加 t
 - `checkpoint.py:8–9` 固定 CUDA BF16/FlashAttention 2，本脚本自行加载 FP32/eager。
 - `vllm_utils.py` 的 `start_server` 固定 BF16，新 backend 使用独立启动命令，继续调用原来的同步函数，不改原文件。
 - `grpo_components.py:140–147` 内部 backward/step，metadata 为空。日志和裁剪通过显式 optimizer adapter/额外 entropy forward 补齐，未重写核心 loss。
-- `utils.py:19–20` 分别 encode prompt/output，仅接受文本。脚本不自动加 BOS，保留生成 token 并检查 decode→encode 一致；若 byte token 解码有损会报错，彻底支持需要改原接口接收 token IDs。
+- `utils.py:19–20` 分别 encode prompt/output。生成 token 解码再编码不保证相同，例如真实 OLMo tokenizer 的 `[71,4896]` 解码为 `hello`，重新编码得到 `[15339]`。脚本用 `TokenizedResponse`（携带原始 token IDs 的字符串）和显式 `RolloutTokenizer` 适配器，把实际采样的 IDs 交给原有训练/entropy 函数；prompt 仍按正常方式编码。评分和日志使用可读文本，同样文本对应的不同 token 序列也分别保留，无需修改原函数或 monkey patch。验证不再因正常的非唯一 token 分词而中断。
 - `utils.py:60` 不传 attention_mask；训练右 padding 在 OLMo 2 因果 attention 中不影响之前的有效 token，loss 已屏蔽 padding。生成则显式传左 padding mask。
 - 仅支持零 dropout 模型（OLMo 2 默认满足），不开放尚未实现的 off-policy/其他 normalizer 变体。
 
@@ -178,6 +178,6 @@ checkpoint 不再保存 Adam 状态：全量 FP32 权重约 **5.53 GiB**，加 t
 python -m pytest tests/test_grpo_onpolicy_script.py -q
 ```
 
-覆盖已有 train step 的实际参数更新、梯度累积等价性、生成/训练/验证/保存/恢复、CPU AdamW 与标准 PyTorch AdamW 等价性、EOS 评分和 replica 同步、vLLM 启动配置。
+覆盖已有 train step 的实际参数更新、梯度累积等价性、生成/训练/验证/保存/恢复、CPU AdamW 与标准 PyTorch AdamW 等价性、EOS 评分和 replica 同步、vLLM 启动配置；另有不满足 decode→encode 一致性的回归测试，确认训练标签、mask、长度与原始采样 token 一致。
 另检查真实 OLMo tokenizer 的停止字符串和 GSM8K 读取。
 **未验证：双 T4 峰值显存/吞吐/主机内存、Kaggle 安装、vLLM/NCCL GPU 集成、wandb 联网、真实 1B 收敛。**

@@ -11,6 +11,44 @@ import sys
 import torch
 
 
+class TokenizedResponse(str):
+    """Decoded display/reward text carrying the original sampled token IDs.
+
+    Metadata belongs to this response object, so identical text from different
+    token sequences remains distinguishable. JSON serializes the ordinary text.
+    """
+    def __new__(cls, text, token_ids):
+        obj = super().__new__(cls, text)
+        obj.token_ids = tuple(token_ids)
+        if not obj.token_ids:
+            raise ValueError('Generation returned no response tokens')
+        return obj
+
+    def __getnewargs__(self):
+        return str(self), self.token_ids
+
+
+class RolloutTokenizer:
+    """Explicit adapter for the existing text-only train-step interface.
+
+    For generated responses use their sampled IDs; delegate ordinary prompt
+    encoding and tokenizer attributes. Does not mutate the HF tokenizer or
+    replace any existing function.
+    """
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __getattr__(self, name):
+        return getattr(self.tokenizer, name)
+
+    def encode(self, text, add_special_tokens=True, **kwargs):
+        if isinstance(text, TokenizedResponse):
+            if add_special_tokens or kwargs:
+                raise ValueError('Sampled responses require encode(add_special_tokens=False) without other options')
+            return list(text.token_ids)
+        return self.tokenizer.encode(text, add_special_tokens=add_special_tokens, **kwargs)
+
+
 class TrainingOptimizer(torch.optim.Optimizer):
     """Explicit optimizer adapter: log/clip once, optionally run PyTorch AdamW on CPU.
 
@@ -168,9 +206,7 @@ class VLLMRollouts:
                     raise RuntimeError('vLLM did not return nonempty token_ids')
                 text = self.tokenizer.decode(ids, skip_special_tokens=False,
                                              clean_up_tokenization_spaces=False)
-                if self.tokenizer.encode(text, add_special_tokens=False) != ids:
-                    raise RuntimeError('vLLM output tokens do not round-trip through the existing text-only train step')
-                responses.append(text)
+                responses.append(TokenizedResponse(text, ids))
             print(f'[generate/{"train" if sample else "val"}] '
                   f'{len(responses)}/{len(prompts)} responses completed', flush=True)
         return responses
