@@ -1,0 +1,3 @@
+# Optional backend. Install in a separate venv; this may replace torch/CUDA wheels.
+-r requirements-grpo.txt
+vllm==0.19.1
