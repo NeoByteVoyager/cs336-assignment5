@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import socket
 
 import torch
 
@@ -110,7 +111,8 @@ class TransformersRollouts:
             self.model = policy
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
-                source, torch_dtype=torch.float32, attn_implementation='eager').to(device)
+                source, dtype=torch.float16 if args.precision == 'fp16' and args.device == 'cuda' else torch.float32,
+                attn_implementation=args.attn_implementation).to(device)
             self.model.requires_grad_(False)
         self.model.eval()
 
@@ -133,15 +135,78 @@ class TransformersRollouts:
         pass
 
 
+def check_vllm_dependency():
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        installed = version('vllm')
+    except PackageNotFoundError as exc:
+        raise RuntimeError(
+            'vLLM is the default CUDA rollout backend. Install it first with: '
+            'python -m pip install --no-cache-dir -r '
+            'scripts/train_on_policy_script/requirements-grpo-vllm.txt '
+            '(or explicitly select --rollout-backend transformers)'
+        ) from exc
+    if installed != '0.19.1':
+        raise RuntimeError(f'This weight-sync backend requires vllm==0.19.1; found {installed}')
+
+
+def vllm_generation_requests(tokenizer, prompts, args, *, sample, step, model_id):
+    """One parent request per question, n children with different sampling seeds.
+
+    Public Completion API indexes choices in prompt-major, then child order.
+    Grouping n=1 duplicate parents under one seed would duplicate their RNG.
+    """
+    n = args.group_size if sample else 1
+    if len(prompts) % n:
+        raise ValueError('Training prompt batch must contain complete consecutive groups')
+    unique_prompts = []
+    for start in range(0, len(prompts), n):
+        group = prompts[start:start + n]
+        if any(prompt != group[0] for prompt in group):
+            raise ValueError('Responses for the same question must be grouped consecutively')
+        unique_prompts.append(group[0])
+    question_batch_size = max(1, args.rollout_batch_size // n)
+    for start in range(0, len(unique_prompts), question_batch_size):
+        payload = {'model': model_id,
+                   'prompt': [tokenizer.encode(p, add_special_tokens=False)
+                              for p in unique_prompts[start:start + question_batch_size]],
+                   'add_special_tokens': False,
+                   'temperature': args.temperature if sample else 0.0,
+                   'top_p': args.top_p if sample else 1.0,
+                   'top_k': args.top_k if sample and args.top_k else -1,
+                   'min_p': 0.0, 'repetition_penalty': 1.0,
+                   'max_tokens': args.max_new_tokens, 'n': n,
+                   'seed': args.seed + step * 100000 + start * n,
+                   'return_token_ids': True, 'skip_special_tokens': False}
+        if args.stop_string:
+            payload.update(stop=[args.stop_string], include_stop_str_in_output=True)
+        yield payload
+
+
+def decode_vllm_choices(tokenizer, result, expected):
+    choices = sorted(result['choices'], key=lambda row: row['index'])
+    if [row['index'] for row in choices] != list(range(expected)):
+        raise RuntimeError('vLLM returned missing, duplicate or unexpected completion indexes')
+    responses = []
+    for row in choices:
+        ids = row.get('token_ids')
+        if not ids:
+            raise RuntimeError('vLLM did not return nonempty token_ids')
+        text = tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        responses.append(TokenizedResponse(text, ids))
+    return responses
+
+
 def build_vllm_command(args, source):
-    """Pinned to vLLM 0.19.1. FP32 also keeps weight-transfer dtypes identical."""
+    """Pinned to vLLM 0.19.1; inference and policy weight dtypes must match."""
     return [sys.executable, '-m', 'vllm.entrypoints.cli.main', 'serve', str(source),
             '--host', '127.0.0.1', '--port', str(args.vllm_port),
-            '--dtype', 'float32', '--enforce-eager', '--attention-backend', 'TRITON_ATTN',
+            '--dtype', 'float16' if args.precision == 'fp16' else 'float32', '--enforce-eager', '--attention-backend', 'TRITON_ATTN',
             '--tensor-parallel-size', '1', '--seed', str(args.seed),
             '--max-model-len', str(args.max_prompt_tokens + args.max_new_tokens),
             '--max-num-seqs', str(args.rollout_batch_size),
-            '--max-num-batched-tokens', str(max(1024, args.max_prompt_tokens + args.max_new_tokens)),
+            '--max-num-batched-tokens', str(max(2048, args.max_prompt_tokens + args.max_new_tokens)),
+            '--enable-prefix-caching',
             '--gpu-memory-utilization', str(args.vllm_memory_utilization),
             '--generation-config', 'vllm',
             '--weight-transfer-config', json.dumps({'backend': 'nccl'})]
@@ -150,22 +215,30 @@ def build_vllm_command(args, source):
 class VLLMRollouts:
     """Reuse existing NCCL synchronization, with a T4-compatible server launch.
 
-    Opt-in: startup, Triton kernels and NCCL must be verified on the target Kaggle
+    Startup, Triton kernels and NCCL must be verified on the target Kaggle
     driver. No fallback to stale weights or the initial checkpoint is permitted.
     """
     def __init__(self, policy, source, device, tokenizer, args, generate_fn=None):
-        from importlib.metadata import version
         from cs336_alignment.vllm_utils import VLLMServer, wait_for_server
-        if version('vllm') != '0.19.1':
-            raise RuntimeError('The optional vLLM backend requires vllm==0.19.1')
+        check_vllm_dependency()
+        # Refuse a busy port rather than accidentally syncing another server.
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(('127.0.0.1', args.vllm_port))
         self.policy, self.tokenizer, self.args = policy, tokenizer, args
         self.server = VLLMServer(str(source), port=args.vllm_port,
                                  gpu=torch.device(device).index, seed=args.seed,
                                  launch_server=False)
         env = os.environ.copy()
-        env.update(CUDA_VISIBLE_DEVICES=str(torch.device(device).index),
+        visible = env.get('CUDA_VISIBLE_DEVICES')
+        physical_gpu = (visible.split(',')[torch.device(device).index].strip()
+                        if visible else str(torch.device(device).index))
+        env.update(CUDA_VISIBLE_DEVICES=physical_gpu,
                    VLLM_SERVER_DEV_MODE='1', VLLM_LOGGING_LEVEL='INFO')
-        self.log = (Path(args.output_dir) / 'vllm-server.log').open('a')
+        self.log_path = Path(args.output_dir) / 'vllm-server.log'
+        self.log = self.log_path.open('a')
+        print(f'Starting vLLM: precision={args.precision}, device={device}, '
+              f'max-num-seqs={args.rollout_batch_size}; server log: {self.log_path}', flush=True)
         self.server.process = subprocess.Popen(build_vllm_command(args, source), env=env,
                                                stdout=self.log, stderr=subprocess.STDOUT,
                                                start_new_session=True)
@@ -173,6 +246,9 @@ class VLLMRollouts:
         try:
             wait_for_server(self.server.base_url, self.server.process, args.vllm_startup_timeout)
             self.server.init_weight_sync(str(next(policy.parameters()).device))
+        except Exception as exc:
+            self.close()
+            raise RuntimeError(f'vLLM startup/weight-sync initialization failed; inspect {self.log_path}: {exc}') from exc
         except BaseException:
             self.close()
             raise
@@ -183,31 +259,11 @@ class VLLMRollouts:
     def generate(self, prompts, *, sample, step):
         from cs336_alignment.vllm_utils import _http_json
         responses = []
-        for start in range(0, len(prompts), self.args.rollout_batch_size):
-            # Token prompts match the existing tokenizer helper (no implicit BOS).
-            payload = {'model': self.server.model_id,
-                       'prompt': [self.tokenizer.encode(p, add_special_tokens=False)
-                                  for p in prompts[start:start + self.args.rollout_batch_size]],
-                       'temperature': self.args.temperature if sample else 0.0,
-                       'top_p': self.args.top_p if sample else 1.0,
-                       'top_k': self.args.top_k if sample and self.args.top_k else -1,
-                       'max_tokens': self.args.max_new_tokens, 'n': 1,
-                       'seed': self.args.seed + step * 100000 + start,
-                       'return_token_ids': True, 'skip_special_tokens': False}
-            if self.args.stop_string:
-                payload.update(stop=[self.args.stop_string], include_stop_str_in_output=True)
+        for payload in vllm_generation_requests(self.tokenizer, prompts, self.args,
+                                               sample=sample, step=step, model_id=self.server.model_id):
             result = _http_json('POST', self.server.base_url + '/v1/completions', payload, timeout=3600)
-            choices = sorted(result['choices'], key=lambda row: row['index'])
-            if len(choices) != len(payload['prompt']):
-                raise RuntimeError('vLLM returned an unexpected number of completions')
-            for row in choices:
-                ids = row.get('token_ids')
-                if not ids:
-                    raise RuntimeError('vLLM did not return nonempty token_ids')
-                text = self.tokenizer.decode(ids, skip_special_tokens=False,
-                                             clean_up_tokenization_spaces=False)
-                responses.append(TokenizedResponse(text, ids))
-            print(f'[generate/{"train" if sample else "val"}] '
+            responses.extend(decode_vllm_choices(self.tokenizer, result, len(payload['prompt']) * payload['n']))
+            print(f'[vllm/generate/{"train" if sample else "val"}] '
                   f'{len(responses)}/{len(prompts)} responses completed', flush=True)
         return responses
 

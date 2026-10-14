@@ -1,3 +1,4 @@
-# Optional backend. Install in a separate venv; this may replace torch/CUDA wheels.
+# Default CUDA inference backend. Install with --no-cache-dir to avoid wheel cache disk use.
+# vLLM 0.19.1 pins torch/torchaudio 2.10.0 and torchvision 0.25.0; wheels may be replaced.
 -r requirements-grpo.txt
 vllm==0.19.1

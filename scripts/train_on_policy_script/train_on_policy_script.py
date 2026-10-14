@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Two-GPU, full-parameter FP32 GRPO using the project's existing train step.
+"""Two-GPU, full-parameter mixed-precision GRPO using the project's loss components.
 
-See scripts/train_on_policy_script/README_grpo_onpolicy.md. Optional vLLM; no AMP, loss replacement or patching.
+See scripts/train_on_policy_script/README_grpo_onpolicy.md. FP16 AMP and FP32 CPU master weights; original implementation untouched.
 """
 from __future__ import annotations
 
@@ -24,8 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from cs336_alignment.drgrpo_grader import question_only_reward_fn, r1_zero_reward_fn
 from cs336_alignment.onpolicy_grpo.grpo_components import grpo_train_step
 from cs336_alignment.onpolicy_grpo.utils import tokenize_prompt_and_output, get_reponse_log_probs
+from scripts.train_on_policy_script.amp_train_step import MasterWeightOptimizer, grpo_train_step_amp, cast_model_to_fp16
 from scripts.train_on_policy_script.grpo_runtime import (
-    TrainingOptimizer, TransformersRollouts, VLLMRollouts, TokenizedResponse, RolloutTokenizer,
+    TrainingOptimizer, TransformersRollouts, VLLMRollouts, TokenizedResponse, RolloutTokenizer, check_vllm_dependency,
 )
 
 DEFAULT_PROMPT = (
@@ -44,10 +45,14 @@ def parse_args(argv=None):
     p.add_argument('--output-dir', default='runs/grpo')
     p.add_argument('--resume', help='resume model/step from a trusted checkpoint; optimizer state starts fresh')
     p.add_argument('--device', choices=['cuda', 'cpu'], default='cuda')
+    p.add_argument('--precision', choices=['fp16', 'fp32'], default='fp16')
+    p.add_argument('--amp-init-scale', type=float, default=128.0)
+    p.add_argument('--attn-implementation', choices=['sdpa', 'eager'], default='sdpa')
     p.add_argument('--train-gpu', type=int, default=0)
     p.add_argument('--rollout-gpu', type=int, default=1, help='-1: share training GPU; default: second GPU')
-    p.add_argument('--rollout-backend', choices=['transformers', 'vllm'], default='transformers')
-    p.add_argument('--rollout-batch-size', type=int, default=4)
+    p.add_argument('--rollout-backend', choices=['transformers', 'vllm'], default=None,
+                   help='default: vllm on CUDA, transformers for CPU smoke tests')
+    p.add_argument('--rollout-batch-size', type=int, default=32, help='vLLM concurrent sequence limit / response batching cap')
     p.add_argument('--optimizer', choices=['adamw_cpu', 'sgd'], default='adamw_cpu')
     p.add_argument('--train-size', type=int, default=6400)
     p.add_argument('--stop-string', default='auto', help='auto: </answer> for r1_zero; empty string disables')
@@ -56,7 +61,7 @@ def parse_args(argv=None):
     p.add_argument('--vllm-port', type=int, default=8000)
     p.add_argument('--vllm-memory-utilization', type=float, default=0.75)
     p.add_argument('--vllm-startup-timeout', type=int, default=600)
-    p.add_argument('--train-steps', type=int, default=100, help='total optimizer updates, including resumed updates')
+    p.add_argument('--train-steps', type=int, default=100, help='total rollout iterations, including resumed steps; gradient overflow may skip an update')
     p.add_argument('--prompts-per-step', type=int, default=1)
     p.add_argument('--group-size', type=int, default=4)
     p.add_argument('--gradient-accumulation-steps', type=int, default=4)
@@ -75,6 +80,8 @@ def parse_args(argv=None):
     p.add_argument('--wandb-project')
     p.add_argument('--wandb-name')
     args = p.parse_args(argv)
+    if args.rollout_backend is None:
+        args.rollout_backend = 'vllm' if args.device == 'cuda' else 'transformers'
     positive = ['train_steps', 'prompts_per_step', 'gradient_accumulation_steps',
                 'max_prompt_tokens', 'max_new_tokens', 'eval_every', 'eval_size', 'save_every',
                 'rollout_batch_size', 'entropy_every', 'train_size', 'vllm_startup_timeout']
@@ -94,6 +101,8 @@ def parse_args(argv=None):
         p.error('prompts-per-step * group-size must be divisible by gradient-accumulation-steps')
     if not (args.temperature > 0 and 0 < args.top_p <= 1 and args.top_k >= 0):
         p.error('require temperature > 0, 0 < top-p <= 1, top-k >= 0')
+    if args.amp_init_scale <= 0:
+        p.error('amp-init-scale must be positive')
     if args.learning_rate <= 0 or args.max_grad_norm <= 0 or args.log_samples < 0:
         p.error('learning-rate and max-grad-norm must be positive; log-samples must be nonnegative')
     if (args.temperature, args.top_p, args.top_k) != (1.0, 1.0, 0):
@@ -157,7 +166,10 @@ def generate_responses(model, tokenizer, prompts, args, *, sample):
     config.eos_token_id = tokenizer.eos_token_id
     responses = []
     device = next(model.parameters()).device
-    with torch.inference_mode():
+    with torch.inference_mode(), torch.autocast(
+        device_type=device.type, dtype=torch.float16,
+        enabled=device.type == 'cuda' and args.precision == 'fp16', cache_enabled=False,
+    ):
         for start in range(0, len(prompts), args.rollout_batch_size):
             batch = prompts[start:start + args.rollout_batch_size]
             tokenizer.padding_side = 'left'
@@ -317,6 +329,9 @@ def save_checkpoint(model, tokenizer, sampler, args, config, step):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.device == 'cpu' and args.precision == 'fp16':
+        print('CPU smoke test: using FP32; CUDA training defaults to FP16 AMP.', flush=True)
+        args.precision = 'fp32'
     if args.device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA is unavailable; use --device cpu only for a tiny smoke test')
     train_device = f'cuda:{args.train_gpu}' if args.device == 'cuda' else 'cpu'
@@ -326,6 +341,9 @@ def main(argv=None):
         if torch.cuda.device_count() <= required:
             raise RuntimeError('Requested GPUs unavailable. Dual-T4 default requires two GPUs; use --rollout-gpu -1 for one GPU')
         torch.cuda.set_device(args.train_gpu)
+    if args.rollout_backend == 'vllm':
+        check_vllm_dependency()  # Fail before downloads/model allocation when installation is missing.
+    print(f'Rollout backend={args.rollout_backend}, concurrency={args.rollout_batch_size}', flush=True)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     sampler = random.Random(args.seed)
@@ -339,7 +357,7 @@ def main(argv=None):
     if args.resume:
         state = torch.load(Path(args.resume) / 'trainer_state.pt', map_location='cpu', weights_only=False)
         mutable = {'resume', 'output_dir', 'train_steps', 'eval_every', 'save_every',
-                   'log_samples', 'keep_checkpoints', 'vllm_port', 'vllm_startup_timeout', 'wandb_project', 'wandb_name', 'train_path', 'val_path', 'prompt_template'}
+                   'rollout_backend', 'rollout_batch_size', 'vllm_memory_utilization', 'precision', 'amp_init_scale', 'attn_implementation', 'log_samples', 'keep_checkpoints', 'vllm_port', 'vllm_startup_timeout', 'wandb_project', 'wandb_name', 'train_path', 'val_path', 'prompt_template'}
         changed = [key for key in config if key not in mutable and config[key] != state['config'].get(key)]
         if changed:
             raise ValueError(f'Resume configuration differs: {changed}')
@@ -357,7 +375,7 @@ def main(argv=None):
         raise ValueError('Not enough training questions for prompts-per-step')
     train = random.Random(args.seed).sample(train, min(args.train_size, len(train)))
     model = AutoModelForCausalLM.from_pretrained(
-        source, torch_dtype=torch.float32, attn_implementation='eager',
+        source, dtype=torch.float32, attn_implementation=args.attn_implementation,
     ).to(train_device)
     if args.max_prompt_tokens + args.max_new_tokens > model.config.max_position_embeddings:
         raise ValueError('Prompt + response token limits exceed model context length')
@@ -369,11 +387,17 @@ def main(argv=None):
         raise ValueError('This simple version requires zero dropout (OLMo 2 default)')
     model.config.use_cache = False
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
-    optimizer = TrainingOptimizer(model.parameters(), args.learning_rate, args.max_grad_norm, args.optimizer)
+    # Clone original FP32 weights before quantizing the GPU model to FP16.
+    optimizer = MasterWeightOptimizer(model.parameters(), args.learning_rate, args.optimizer)
+    if args.precision == 'fp16':
+        cast_model_to_fp16(model)
+    scaler = torch.amp.GradScaler(
+        args.device, init_scale=args.amp_init_scale, enabled=args.precision == 'fp16',
+    )
     optimizer.zero_grad(set_to_none=True)
     start = 0
     if state:
-        print('Resuming model weights and step; optimizer state is reset (not restored).', flush=True)
+        print('Resuming model weights and step; optimizer state is reset (not restored); AMP loss scale restarts.', flush=True)
         sampler.setstate(state['sampler_rng'])
         torch.set_rng_state(state['torch_rng'])
         if state['cuda_rng'] is not None:
@@ -383,13 +407,16 @@ def main(argv=None):
     checkpoint_plan(model, args)  # Fail before expensive rollouts if saving cannot fit.
     (logger.root / f'config-from-step-{start}.json').write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(f'FP32 parameters+gradients lower bound: '
-          f'{sum(p.numel() for p in model.parameters()) * 8 / 2**30:.2f} GiB; '
-          'activations/logits/KV/cache need additional memory.', flush=True)
+    element_bytes = 2 if args.precision == 'fp16' else 4
+    print(f'{args.precision.upper()} model parameters+gradients lower bound: '
+          f'{sum(p.numel() for p in model.parameters()) * element_bytes * 2 / 2**30:.2f} GiB; '
+          f'FP32 CPU master weights, attention={args.attn_implementation}, AMP={scaler.is_enabled()}. '
+          'Activations/logits/workspaces need additional memory.', flush=True)
     if args.optimizer == 'adamw_cpu':
         print(f'CPU master parameters + Adam state lower bound: '
               f'{sum(p.numel() for p in model.parameters()) * 12 / 2**30:.2f} GiB; '
-              'additional host memory is needed for loading/saving and temporary tensors.', flush=True)
+              'plus up to one full FP32 gradient buffer during the CPU update '
+              f'({sum(p.numel() for p in model.parameters()) * 4 / 2**30:.2f} GiB) and temporary tensors.', flush=True)
     reward_fn = make_reward_fn(tokenizer, args.reward)
     runtime = TransformersRollouts if args.rollout_backend == 'transformers' else VLLMRollouts
     devices = list(range(torch.cuda.device_count())) if args.device == 'cuda' else []
@@ -397,7 +424,7 @@ def main(argv=None):
         rollouts = runtime(model, source, rollout_device, tokenizer, args, generate_responses)
     try:
         run_training(model, tokenizer, optimizer, sampler, train, val, args, config,
-                     reward_fn, start, logger, rollouts)
+                     reward_fn, start, logger, rollouts, scaler)
     finally:
         rollouts.close()
         if logger.run:
@@ -405,7 +432,7 @@ def main(argv=None):
 
 
 def run_training(model, tokenizer, optimizer, sampler, train, val, args, config,
-                 reward_fn, start, logger, rollouts):
+                 reward_fn, start, logger, rollouts, scaler):
     training_tokenizer = RolloutTokenizer(tokenizer)
     logger.progress(start, 'Synchronizing rollout model for initial validation')
     rollouts.sync()
@@ -422,39 +449,36 @@ def run_training(model, tokenizer, optimizer, sampler, train, val, args, config,
         responses = rollouts.generate(prompts, sample=True, step=step)
         scores = score_responses(responses, truths, reward_fn)
         logger.progress(step, f'Rollout completed: reward={scores["reward"]:.4f}, format_reward={scores["format_reward"]:.4f}')
-        if step % args.entropy_every == 0:
-            logger.progress(step, 'Computing response-token entropy')
-            entropy = token_entropy(model, training_tokenizer, prompts, responses)
-        else:
-            entropy = None
-        logger.progress(step, f'Updating policy: {args.gradient_accumulation_steps} microbatches, optimizer={args.optimizer}')
-        model.train()
-        # Exactly one call/update per fresh rollout. Accumulation is internal.
-        loss, _ = grpo_train_step(
-            model=model, tokenizer=training_tokenizer, optimizer=optimizer,
+        logger.progress(step, f'Updating policy: {args.gradient_accumulation_steps} microbatches, '
+                        f'precision={args.precision}, optimizer={args.optimizer}')
+        # One loss-scaled update per fresh rollout; overflow discards this rollout.
+        loss, metadata = grpo_train_step_amp(
+            model=model, tokenizer=training_tokenizer, optimizer=optimizer, scaler=scaler,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            max_grad_norm=None, reward_fn=reward_fn,  # adapter clips/logs immediately before update
+            max_grad_norm=args.max_grad_norm, reward_fn=reward_fn,
             repeated_prompts=prompts, rollout_responses=responses,
             repeated_ground_truths=truths, group_size=args.group_size,
-            baseline='mean', advantage_normalizer='std',
-            importance_reweighting_method='none', loss_normalization='sequence',
+            precision=args.precision, log_entropy=step % args.entropy_every == 0,
+            progress=lambda message: logger.progress(step, message),
         )
         if not torch.isfinite(loss):
             raise FloatingPointError('Nonfinite loss; stop without saving this update')
         event = {'step': step, 'train/loss': loss.item(), 'train/reward': scores['reward'],
                  'train/format_reward': scores['format_reward'],
-                 'train/grad_norm': optimizer.grad_norm,
+                 'train/grad_norm': metadata['grad_norm'],
+                 'train/amp_scale': metadata['amp_scale'],
+                 'train/optimizer_step_skipped': metadata['optimizer_step_skipped'],
                  'train/response_length': sum(response_lengths(tokenizer, responses)) / len(responses),
                  'train/seconds': time.monotonic() - began}
-        if entropy is not None:
-            event['train/token_entropy'] = entropy
+        if 'token_entropy' in metadata:
+            event['train/token_entropy'] = metadata['token_entropy']
         if args.device == 'cuda':
             for gpu in sorted({args.train_gpu, args.rollout_gpu} - {-1}):
                 event[f'gpu{gpu}/peak_allocated_gib'] = torch.cuda.max_memory_allocated(gpu) / 2**30
         logger.write(event)
         logger.samples('train', step, prompts, responses, truths, args.log_samples)
         if step % args.eval_every == 0 or step == args.train_steps:
-            logger.progress(step, 'Policy updated; syncing weights for validation')
+            logger.progress(step, 'Syncing current policy weights for validation')
             rollouts.sync()
             evaluate(rollouts, tokenizer, val, args, reward_fn, step, logger)
         if step % args.save_every == 0 or step == args.train_steps:

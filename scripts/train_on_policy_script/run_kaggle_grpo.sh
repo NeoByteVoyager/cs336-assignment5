@@ -23,7 +23,7 @@ case "$profile" in
     ;;
   *) echo "Unknown profile: $profile (use smoke, experience, assignment)" >&2; exit 2 ;;
 esac
-output_dir="${GRPO_OUTPUT_DIR:-/kaggle/working/grpo-${profile}}"
+output_dir="${GRPO_OUTPUT_DIR:-/kaggle/working/grpo-${profile}-amp}"
 mkdir -p "$output_dir"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
@@ -31,8 +31,9 @@ if [ -d /kaggle/temp ]; then
   export HF_HOME="${HF_HOME:-/kaggle/temp/huggingface}"
 fi
 python -u scripts/train_on_policy_script/train_on_policy_script.py \
-  --train-gpu 0 --rollout-gpu 1 --rollout-backend transformers \
+  --train-gpu 0 --rollout-gpu 1 --rollout-backend vllm \
+  --precision fp16 --attn-implementation sdpa \
   --optimizer adamw_cpu --learning-rate 1e-5 --max-grad-norm 1.0 \
-  --rollout-batch-size 4 --keep-checkpoints 1 \
+  --rollout-batch-size 32 --keep-checkpoints 1 \
   --output-dir "$output_dir" "${profile_args[@]}" "$@" \
   2>&1 | tee -a "$output_dir/console.log"

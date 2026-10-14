@@ -146,11 +146,12 @@ def test_reward_strips_eos_for_grading_only(tiny):
     assert response.endswith(tokenizer.eos_token)
 
 
-def test_vllm_command_uses_fp32_t4_backend():
+@pytest.mark.parametrize('precision, dtype', [('fp16', 'float16'), ('fp32', 'float32')])
+def test_vllm_command_uses_t4_backend(precision, dtype):
     from scripts.train_on_policy_script.grpo_runtime import build_vllm_command
-    args = runner.parse_args(['--rollout-backend', 'vllm'])
+    args = runner.parse_args(['--rollout-backend', 'vllm', '--precision', precision])
     cmd = build_vllm_command(args, 'model')
-    assert cmd[cmd.index('--dtype') + 1] == 'float32'
+    assert cmd[cmd.index('--dtype') + 1] == dtype
     assert cmd[cmd.index('--attention-backend') + 1] == 'TRITON_ATTN'
     assert '--weight-transfer-config' in cmd
     assert '--enforce-eager' in cmd
@@ -181,7 +182,7 @@ def test_kaggle_launcher_cpu_smoke(tiny, tmp_path):
     env = dict(os.environ, GRPO_OUTPUT_DIR=str(out),
                PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ['PATH'])
     result = subprocess.run(
-        ['bash', 'scripts/train_on_policy_script/run_kaggle_grpo.sh', 'smoke', '--device', 'cpu',
+        ['bash', 'scripts/train_on_policy_script/run_kaggle_grpo.sh', 'smoke', '--device', 'cpu', '--rollout-backend', 'transformers',
          '--model-name', str(source), '--train-path', str(data), '--val-path', str(data),
          '--prompt-template', str(prompt), '--reward', 'question_only',
          '--max-prompt-tokens', '8', '--max-new-tokens', '4'],
