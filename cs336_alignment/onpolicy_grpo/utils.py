@@ -58,10 +58,10 @@ def get_reponse_log_probs(
 ) -> dict[str, torch.Tensor]:
 
     logits = model(input_ids).logits
-    all_log_probs = torch.log_softmax(logits, dim=-1)
+    all_log_probs = torch.log_softmax(logits, dim=-1, dtype=torch.float32)
     batch_size, seq_len = input_ids.shape
-    batch_id = torch.arange(0, batch_size)[:, None]
-    seq_id = torch.arange(0, seq_len)[None, :]
+    batch_id = torch.arange(0, batch_size, device=logits.device)[:, None]
+    seq_id = torch.arange(0, seq_len, device=logits.device)[None, :]
     log_probs = all_log_probs[batch_id, seq_id, labels]
 
     if return_token_entropy:

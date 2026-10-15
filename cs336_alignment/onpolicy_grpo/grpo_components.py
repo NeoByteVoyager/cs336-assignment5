@@ -117,10 +117,12 @@ def grpo_train_step(
     response_mask = tokenizer_output["response_mask"].to(device)
 
     # 2. compute rewards
-    raw_rewards = compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)[0]
+    raw_rewards, reward_metadata = compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)
     normalized_reward = compute_group_normalized_reward(raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer)[0].to(device)
 
     batch_loss = 0
+    entropy_sum = 0.0
+    token_count = 0
     # 3.gradient accumulation
     assert len(input_ids) % gradient_accumulation_steps == 0
     microbatch_size = len(input_ids) // gradient_accumulation_steps
@@ -130,7 +132,10 @@ def grpo_train_step(
         mask_microbatch = response_mask[i: i + microbatch_size, ...]
         reward_microbatch = normalized_reward[i: i + microbatch_size, ...]
         # calculate log_probs
-        log_probs = get_reponse_log_probs(model, inputs_microbatch, labels_microbatch)["log_probs"]
+        log_prob_output = get_reponse_log_probs(model, inputs_microbatch, labels_microbatch, return_token_entropy=True)
+        log_probs = log_prob_output["log_probs"]
+        entropy_sum += log_prob_output["token_entropy"].detach().masked_fill(~mask_microbatch, 0).sum().item()
+        token_count += mask_microbatch.sum().item()
         # compute policy gradient loss
         per_token_policy_gradient_loss = compute_policy_gradient_loss(reward_microbatch, log_probs, importance_reweighting_method, old_log_probs, cliprange, mask_microbatch)[0]
         # aggregate loss
@@ -139,14 +144,14 @@ def grpo_train_step(
         # backward and accumulate gradient
         microbatch_loss.backward()
 
-    if max_grad_norm is not None:
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(), max_grad_norm
-        )
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), max_grad_norm if max_grad_norm is not None else float("inf"),
+        error_if_nonfinite=True,
+    )
     optimizer.step()
     optimizer.zero_grad()
 
     return (
         torch.tensor(batch_loss),
-        {}
+        {**reward_metadata, "grad_norm": grad_norm.item(), "token_entropy": entropy_sum / max(token_count, 1)}
     )
