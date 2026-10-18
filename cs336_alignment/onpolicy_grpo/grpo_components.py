@@ -1,4 +1,6 @@
 import torch
+from sympy import sequence
+from torch import autocast
 from torch.optim import Optimizer
 from typing import Callable, Literal
 from transformers import PreTrainedModel, PreTrainedTokenizer
@@ -32,8 +34,7 @@ def compute_group_normalized_reward(
     advantage_eps: float = 1e-6,
     advantage_normalizer: Literal["none", "mean", "std"] = "std"
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    if baseline !="mean" or advantage_normalizer != "std":
-        raise NotImplementedError
+
     # reshape[quention_size, group_size], must use returns
     rewards = raw_rewards.reshape(-1, group_size)
 
@@ -41,8 +42,15 @@ def compute_group_normalized_reward(
     reward_std = torch.std(rewards, dim=-1, keepdim=True)
 
     normalized_reward = None
-    if baseline == "mean" and advantage_normalizer == "std":
-        normalized_reward = (rewards - reward_mean) / (reward_std + advantage_eps)
+    if baseline == "mean":
+        normalized_reward = rewards - reward_mean
+    elif baseline == "none":
+        normalized_reward = rewards
+
+    if advantage_normalizer == "std":
+        normalized_reward = normalized_reward / (reward_std + advantage_eps)
+    elif advantage_normalizer == "mean":
+        normalized_reward = normalized_reward / reward_mean
 
     return (
         normalized_reward.flatten(),
@@ -83,8 +91,12 @@ def aggregate_loss_across_microbatch(
     mask_per_token_policy_gradient_loss = per_token_policy_gradient_loss.masked_fill(~mask, 0)
     # only average on the valid tokens, can not use mean
     # and must first average on seq , then average on batch
-    sequence_loss = mask_per_token_policy_gradient_loss.sum(dim=-1) / mask.sum(dim=-1)
-    return sequence_loss.mean()
+    if loss_normalization == "sequence":
+        sequence_loss = mask_per_token_policy_gradient_loss.sum(dim=-1) / mask.sum(dim=-1)
+        return sequence_loss.mean()
+    else:
+        return mask_per_token_policy_gradient_loss.sum() / normalization_constant
+
 
 def grpo_train_step(
      model: PreTrainedModel,
@@ -108,7 +120,11 @@ def grpo_train_step(
      # Loss normalization
      loss_normalization: Literal["sequence", "constant"] = "sequence",
      normalization_constant: int | None = None,
+     # mixprecision
+     scaler: None | torch.amp.GradScaler = None,
+     amp_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+
     device = next(model.parameters()).device
     # 1.tokenize the prompt and output
     tokenizer_output = tokenize_prompt_and_output(repeated_prompts, rollout_responses, tokenizer)
@@ -132,7 +148,13 @@ def grpo_train_step(
         mask_microbatch = response_mask[i: i + microbatch_size, ...]
         reward_microbatch = normalized_reward[i: i + microbatch_size, ...]
         # calculate log_probs
-        log_prob_output = get_reponse_log_probs(model, inputs_microbatch, labels_microbatch, return_token_entropy=True)
+        with torch.autocast(
+                device.type,
+                amp_dtype,
+                enabled=scaler is not None
+        ):
+            log_prob_output = get_reponse_log_probs(model, inputs_microbatch, labels_microbatch, return_token_entropy=True)
+
         log_probs = log_prob_output["log_probs"]
         entropy_sum += log_prob_output["token_entropy"].detach().masked_fill(~mask_microbatch, 0).sum().item()
         token_count += mask_microbatch.sum().item()
@@ -142,13 +164,23 @@ def grpo_train_step(
         microbatch_loss = microbatch_size / len(input_ids) * aggregate_loss_across_microbatch(per_token_policy_gradient_loss, mask_microbatch, loss_normalization, normalization_constant)
         batch_loss += microbatch_loss.item()
         # backward and accumulate gradient
-        microbatch_loss.backward()
+        if scaler is not None:
+            scaled_loss = scaler.scale(microbatch_loss)
+            scaled_loss.backward()
+        else:
+            microbatch_loss.backward()
 
+    if scaler is not None:
+        scaler.unscale_(optimizer)
     grad_norm = torch.nn.utils.clip_grad_norm_(
         model.parameters(), max_grad_norm if max_grad_norm is not None else float("inf"),
-        error_if_nonfinite=True,
+        error_if_nonfinite=False,
     )
-    optimizer.step()
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
     optimizer.zero_grad()
 
     return (

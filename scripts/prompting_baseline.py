@@ -8,9 +8,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
-def load():
-    tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-2-0425-1B")
-    model = AutoModelForCausalLM.from_pretrained("allenai/OLMo-2-0425-1B", device_map="auto")
+def load(model_name: str):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
     pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
 
     config = deepcopy(model.generation_config)
@@ -29,6 +29,8 @@ def inference(pipe, config, tokenizer, prompt_path, data_path, is_r1, question_n
     ).read_text()
     with open(data_path, "r") as f:
         i = 0
+        total_rewards = 0.0
+        total_format_rewards = 0.0
         for line in f:
             data = json.loads(line)
             question = data["question"]
@@ -55,17 +57,22 @@ def inference(pipe, config, tokenizer, prompt_path, data_path, is_r1, question_n
             print("answer_reward: ", reward["answer_reward"])
             print("reward: ", reward["reward"])
             print("-" * 80)
+            total_rewards += reward["reward"]
+            total_format_rewards += reward["format_reward"]
             i += 1
             if i >= question_num:
                 break
+        print("total_rewards: ", total_rewards)
+        print("total_format_rewards: ", total_format_rewards)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt_path", type=str)
     parser.add_argument("--question_num", type=int)
+    parser.add_argument("--model_name", type=str)
     args = parser.parse_args()
 
-    pipe, config, model, tokenizer = load()
+    pipe, config, model, tokenizer = load(args.model_name)
     '''
     prompt_path1 = "cs336_alignment/prompts/question_only.prompt"
     prompt_path2 = "cs336_alignment/prompts/r1_zero.prompt"
