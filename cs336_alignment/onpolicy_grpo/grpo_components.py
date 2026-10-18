@@ -50,7 +50,7 @@ def compute_group_normalized_reward(
     if advantage_normalizer == "std":
         normalized_reward = normalized_reward / (reward_std + advantage_eps)
     elif advantage_normalizer == "mean":
-        normalized_reward = normalized_reward / reward_mean
+        normalized_reward = normalized_reward / (reward_mean + advantage_eps)
 
     return (
         normalized_reward.flatten(),
@@ -147,6 +147,13 @@ def grpo_train_step(
         labels_microbatch = labels[i: i + microbatch_size, ...]
         mask_microbatch = response_mask[i: i + microbatch_size, ...]
         reward_microbatch = normalized_reward[i: i + microbatch_size, ...]
+        nonzero_advantage = reward_microbatch != 0
+        if not nonzero_advantage.any():
+            continue
+        inputs_microbatch = inputs_microbatch[nonzero_advantage]
+        labels_microbatch = labels_microbatch[nonzero_advantage]
+        mask_microbatch = mask_microbatch[nonzero_advantage]
+        reward_microbatch = reward_microbatch[nonzero_advantage]
         # calculate log_probs
         with torch.autocast(
                 device.type,
@@ -161,7 +168,9 @@ def grpo_train_step(
         # compute policy gradient loss
         per_token_policy_gradient_loss = compute_policy_gradient_loss(reward_microbatch, log_probs, importance_reweighting_method, old_log_probs, cliprange, mask_microbatch)[0]
         # aggregate loss
-        microbatch_loss = microbatch_size / len(input_ids) * aggregate_loss_across_microbatch(per_token_policy_gradient_loss, mask_microbatch, loss_normalization, normalization_constant)
+        microbatch_loss = aggregate_loss_across_microbatch(per_token_policy_gradient_loss, mask_microbatch, loss_normalization, normalization_constant)
+        if loss_normalization == "sequence":
+            microbatch_loss = microbatch_loss * len(inputs_microbatch) / len(input_ids)
         batch_loss += microbatch_loss.item()
         # backward and accumulate gradient
         if scaler is not None:
