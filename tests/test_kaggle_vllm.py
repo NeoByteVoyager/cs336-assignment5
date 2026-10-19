@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from types import ModuleType
 import json
+from pathlib import Path
 import sys
 
 import pytest
@@ -10,7 +11,21 @@ import torch
 from safetensors.torch import load_file
 
 from cs336_alignment import vllm_utils
-from scripts.train_grpo_kaggle import VLLMRollout, generate, inspect_test_samples, parse_args
+from scripts.train_grpo_kaggle import VLLMRollout, cuda_link_environment, generate, inspect_test_samples, parse_args
+
+
+def test_cuda_link_environment_uses_loaded_driver(tmp_path, monkeypatch):
+    driver = tmp_path / "libcuda.so.555.1"
+    driver.touch()
+    original_read = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda p, *a, **kw:
+        f"0000-ffff r-xp 0000 00:00 1 {driver}\n" if str(p) == "/proc/self/maps"
+        else original_read(p, *a, **kw))
+    monkeypatch.setenv("LIBRARY_PATH", "/existing")
+    for _ in range(2):
+        env = cuda_link_environment(tmp_path)
+        assert env["LIBRARY_PATH"] == f"{tmp_path}/cuda_link:/existing"
+        assert (tmp_path / "cuda_link/libcuda.so").resolve() == driver
 
 
 def test_vllm_requests_grouped_independent_samples_and_entropy():
@@ -65,12 +80,14 @@ def test_vllm_server_launch_uses_fp16_and_memory_limits(monkeypatch):
 
     monkeypatch.setattr(vllm_utils.subprocess, "Popen", popen)
     vllm_utils.start_server("model", "127.0.0.1", 8000, 1, 42, "auto", "INFO", 0.75,
+                           env_overrides={"LIBRARY_PATH": "/test/cuda_link"},
                            dtype="float16", extra_args=("--max-num-seqs", "32", "--enforce-eager"))
     command = captured["command"]
     assert command[command.index("--dtype") + 1] == "float16"
     assert command[command.index("--gpu-memory-utilization") + 1] == "0.75"
     assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "1"
     assert captured["env"]["VLLM_SERVER_DEV_MODE"] == "1"
+    assert captured["env"]["LIBRARY_PATH"] == "/test/cuda_link"
     assert "--enforce-eager" in command
 
 

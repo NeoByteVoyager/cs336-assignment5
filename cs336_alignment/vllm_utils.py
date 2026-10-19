@@ -127,8 +127,11 @@ def start_server(
     dtype: str = "bfloat16",
     extra_args: tuple[str, ...] = (),
     log_path: str | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> subprocess.Popen:
     env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["VLLM_SERVER_DEV_MODE"] = "1"
     env["VLLM_LOGGING_LEVEL"] = logging_level

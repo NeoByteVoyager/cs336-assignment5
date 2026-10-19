@@ -42,6 +42,7 @@ not the full-vocabulary entropy computed by the Transformers fallback.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import csv
 import gc
@@ -191,6 +192,33 @@ def require_vllm():
         raise RuntimeError(f"This weight-sync adapter targets vllm==0.19.1, found {installed}")
 
 
+def cuda_link_environment(run_dir):
+    """Expose the loaded driver to JIT linkers in runtime-only containers."""
+    # The policy has initialized CUDA before this call. Use its actual loaded
+    # driver, never a toolkit stub or a guessed driver version.
+    maps = Path("/proc/self/maps")
+    if not maps.exists():
+        return {}
+    for line in maps.read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6:
+            continue
+        driver = Path(fields[5])
+        if not driver.name.startswith("libcuda.so") or not driver.is_file():
+            continue
+        link_dir = (Path(run_dir) / "cuda_link").resolve()
+        link_dir.mkdir(parents=True, exist_ok=True)
+        link = link_dir / "libcuda.so"
+        if link.is_symlink():
+            link.unlink()
+        if not link.exists():
+            link.symlink_to(driver.resolve())
+        existing = os.environ.get("LIBRARY_PATH", "")
+        print(f"CUDA JIT linker: {link} -> {driver}", flush=True)
+        return {"LIBRARY_PATH": str(link_dir) + (os.pathsep + existing if existing else "")}
+    return {}
+
+
 class VLLMRollout:
     """One server on the rollout GPU, with streamed FP16 NCCL weight updates."""
 
@@ -205,6 +233,7 @@ class VLLMRollout:
             self.server.process = start_server(
                 args.model, self.server.host, self.server.port, args.rollout_gpu, seed, "auto", "INFO",
                 args.vllm_memory_fraction, dtype="float16", log_path=str(log_path),
+                env_overrides=cuda_link_environment(run_dir),
                 extra_args=("--max-model-len", str(args.vllm_max_model_len),
                             "--max-num-seqs", str(args.vllm_max_num_seqs),
                             "--max-num-batched-tokens", str(args.vllm_max_batched_tokens),
@@ -215,6 +244,15 @@ class VLLMRollout:
         except BaseException:
             self.close()
             print(f"vLLM startup failed; inspect {log_path}", file=sys.stderr)
+            # Kaggle background runs expose the notebook console first. Include
+            # the subprocess traceback there instead of only its exit code.
+            try:
+                with log_path.open(encoding="utf-8", errors="replace") as handle:
+                    tail = "".join(deque(handle, maxlen=150))
+                print(f"--- vLLM server log (last 150 lines) ---\n{tail}",
+                      file=sys.stderr, flush=True)
+            except OSError as log_error:
+                print(f"Could not read vLLM server log: {log_error}", file=sys.stderr)
             raise
 
     def close(self):
