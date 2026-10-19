@@ -272,8 +272,8 @@ class VLLMRollout:
         n = counts.pop() if len(counts) == 1 else 1
         request_prompts = [prompt for prompt, _ in groups] if n > 1 else prompts
         params = dict(temperature=1.0, top_p=1.0, top_k=-1, max_tokens=args.max_new_tokens,
-                      n=n, seed=self.request_seed)
-        self.request_seed += 1
+                      n=n, seed=self.request_seed, independent_prompt_seeds=True)
+        self.request_seed += len(prompts)
         if args.prompt != "question_only":
             params.update(stop=["</answer>"], include_stop_str_in_output=True)
         if collect_entropy:
@@ -460,7 +460,7 @@ def evaluate(rollout_model, tokenizer, rows, template, reward_fn, args):
                "val_format_reward": rewards["mean_format_reward"],
                "val_response_length": sum(lengths) / len(lengths)}
     samples = [dict(prompt=p, response=r, ground_truth=t, **reward_fn(r, t))
-               for p, r, t in zip(prompts[:8], responses[:8], truths[:8])]
+               for p, r, t in zip(prompts, responses, truths)]
     return metrics, samples
 
 

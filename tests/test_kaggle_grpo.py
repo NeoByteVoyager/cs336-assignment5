@@ -95,6 +95,39 @@ def test_all_zero_advantages_skip_forward_and_optimizer(tiny_train_model, tokeni
     assert not optimizer.state
 
 
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_update_matches_independent_full_batch_formula(tiny_train_model, tokenizer, variant):
+    from cs336_alignment.onpolicy_grpo.utils import tokenize_prompt_and_output
+    reference = deepcopy(tiny_train_model)
+    prompts = ["Hello"] * 4
+    responses = ["world", "a test", "world", "world"]
+    truths = ["42"] * 4
+    args = SimpleNamespace(group_size=2, max_new_tokens=8, microbatch_size=1,
+                           gradient_accumulation_steps=2, max_grad_norm=1e6)
+    opt = torch.optim.SGD(tiny_train_model.parameters(), lr=0.1)
+    train_batch(tiny_train_model, tokenizer, opt, torch.amp.GradScaler("cuda", enabled=False),
+                prompts, responses, truths, reward, args, VARIANTS[variant])
+    batch = tokenize_prompt_and_output(prompts, responses, tokenizer)
+    logits = reference(batch["input_ids"]).logits
+    logp = logits.log_softmax(-1).gather(-1, batch["labels"].unsqueeze(-1)).squeeze(-1)
+    rewards = torch.tensor([[1., 0.], [1., 1.]])
+    advantage = rewards if variant == "rft" else rewards - rewards.mean(-1, keepdim=True)
+    if variant in ("grpo", "grpo_constant"):
+        advantage = advantage / (rewards.std(-1, keepdim=True) + 1e-6)
+    elif variant == "maxrl":
+        advantage = advantage / (rewards.mean(-1, keepdim=True) + 1e-6)
+    per_sequence = (logp * batch["response_mask"]).sum(-1)
+    if variant == "grpo":
+        objective = -(advantage.flatten() * per_sequence / batch["response_mask"].sum(-1)).mean()
+    else:
+        objective = -(advantage.flatten() * per_sequence).sum() / (4 * 8)
+    objective.backward()
+    with torch.no_grad():
+        for actual, initial in zip(tiny_train_model.parameters(), reference.parameters()):
+            expected = initial - 0.1 * initial.grad
+            torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
 def test_assignment_hyperparameters():
     args = parse_args([])
     assert (args.steps, args.train_examples, args.val_examples) == (200, 6400, 1024)
@@ -103,6 +136,21 @@ def test_assignment_hyperparameters():
     assert args.seeds == [0]
     assert args.save_model
     assert args.inspect_examples == 100
+
+
+def test_validation_is_per_answer_and_saves_all_samples(monkeypatch):
+    import scripts.train_grpo_kaggle as script
+    rows = [dict(question=f"Question {i}", answer=f"work #### {i}") for i in range(12)]
+    def generated(model, tokenizer, prompts, args):
+        assert prompts == [f"Question {i}" for i in range(12)]
+        return [str(i) if i < 3 else "wrong" for i in range(12)], [1] * 12, None
+    monkeypatch.setattr(script, "generate", generated)
+    def grader(response, truth):
+        return dict(reward=float(response == truth), format_reward=1.)
+    metrics, samples = script.evaluate(None, None, rows, "{question}", grader, None)
+    assert metrics["val_reward"] == 0.25
+    assert len(samples) == 12
+    assert sum(s["reward"] for s in samples) == 3
 
 
 def test_multiple_runs_keep_one_best_model():

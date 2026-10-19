@@ -201,6 +201,19 @@ def generate_completions(
     if batch_size is not None and batch_size <= 0:
         raise ValueError("batch_size must be positive.")
 
+    if sampling_params.get("independent_prompt_seeds"):
+        # The completions API has one seed for the entire prompt list. Give
+        # each prompt its own range; vLLM uses seed + i for its n children.
+        def complete_one(item):
+            index, prompt = item
+            params = {**sampling_params, "independent_prompt_seeds": False,
+                      "seed": sampling_params["seed"] + index * sampling_params["n"]}
+            return generate_completions(vllm_base_url, model_id, [prompt], params)
+
+        with ThreadPoolExecutor(max_workers=min(batch_size or 32, 32)) as executor:
+            return [completion for batch in executor.map(complete_one, enumerate(prompts))
+                    for completion in batch]
+
     prompt_batches = [prompts]
     if batch_size is not None:
         prompt_batches = [prompts[start : start + batch_size] for start in range(0, len(prompts), batch_size)]
@@ -215,6 +228,7 @@ def generate_completions(
             "n": sampling_params["n"],
             "seed": sampling_params["seed"],
             "return_token_ids": True,
+            "add_special_tokens": False,
         }
         if sampling_params.get("stop") is not None:
             payload["stop"] = sampling_params["stop"]
@@ -225,6 +239,9 @@ def generate_completions(
 
         response = _http_json("POST", f"{vllm_base_url}/v1/completions", payload, timeout=3600)
         choices = sorted(response["choices"], key=lambda choice: choice["index"])
+        expected = len(prompt_batch) * sampling_params["n"]
+        if [choice["index"] for choice in choices] != list(range(expected)):
+            raise RuntimeError("vLLM returned missing, duplicate, or unexpected completion indices")
         completions.extend(
             VLLMCompletion(
                 text=choice["text"],

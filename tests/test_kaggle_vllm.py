@@ -47,12 +47,26 @@ def test_vllm_requests_grouped_independent_samples_and_entropy():
     assert lengths == [1] * 16 and entropy == 1.5
     assert calls[0][0] == ["A", "B"]
     assert calls[0][1]["n"] == 8
-    assert calls[0][1]["seed"] == 10 and backend.request_seed == 11
+    assert calls[0][1]["seed"] == 10 and backend.request_seed == 26
     assert calls[0][1]["stop"] == ["</answer>"]
     assert calls[0][1]["logprobs"] == 0
     assert calls[0][2] == 256
     generate(backend, tokenizer, ["C", "D"], args)
-    assert calls[1][1]["n"] == 1 and calls[1][1]["seed"] == 11
+    assert calls[1][1]["n"] == 1 and calls[1][1]["seed"] == 26
+
+
+def test_prompt_seeds_disjoint_and_out_of_order_choices_aligned(monkeypatch):
+    requests = {}
+    def http(method, url, payload, timeout):
+        prompt = payload["prompt"][0]
+        requests[prompt] = payload
+        return {"choices": [dict(index=i, text=f"{prompt}:{i}") for i in reversed(range(8))]}
+    monkeypatch.setattr(vllm_utils, "_http_json", http)
+    result = vllm_utils.generate_completions("http://localhost", "model", ["A", "B", "C"],
+        dict(temperature=1., max_tokens=512, n=8, seed=10, independent_prompt_seeds=True), batch_size=32)
+    assert [c.text for c in result] == [f"{p}:{i}" for p in "ABC" for i in range(8)]
+    assert [requests[p]["seed"] for p in "ABC"] == [10, 18, 26]
+    assert all(p["add_special_tokens"] is False for p in requests.values())
 
 
 def test_completion_client_forwards_sampling_and_parses_log_probs(monkeypatch):
