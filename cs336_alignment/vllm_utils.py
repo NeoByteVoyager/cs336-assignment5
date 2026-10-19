@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +24,7 @@ class VLLMCompletion:
     text: str
     token_ids: list[int]
     finish_reason: str | None
+    token_log_probs: list[float] | None = None
 
 
 @dataclass
@@ -103,7 +105,7 @@ def _http_json(method: str, url: str, payload: dict | None = None, timeout: int 
 
 
 def kill_existing_vllm_server(port: int) -> None:
-    pattern = f"vllm serve .* --port {port}"
+    pattern = rf"vllm( serve|\.entrypoints\.openai\.api_server) .* --port {port}"
     try:
         result = subprocess.run(["pkill", "-TERM", "-f", pattern], check=False)
         if result.returncode == 0:
@@ -122,21 +124,26 @@ def start_server(
     load_format: str,
     logging_level: str,
     gpu_memory_utilization: float = 0.9,
+    dtype: str = "bfloat16",
+    extra_args: tuple[str, ...] = (),
+    log_path: str | None = None,
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["VLLM_SERVER_DEV_MODE"] = "1"
     env["VLLM_LOGGING_LEVEL"] = logging_level
     command = [
-        "vllm",
-        "serve",
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
         model_id,
         "--host",
         host,
         "--port",
         str(port),
         "--dtype",
-        "bfloat16",
+        dtype,
         "--enable-prefix-caching",
         "--gpu-memory-utilization",
         str(gpu_memory_utilization),
@@ -149,7 +156,11 @@ def start_server(
         "--load-format",
         load_format,
     ]
+    command.extend(extra_args)
     logger.info("Starting vLLM server: %s", " ".join(command))
+    if log_path is not None:
+        with open(log_path, "a", buffering=1) as handle:
+            return subprocess.Popen(command, env=env, start_new_session=True, stdout=handle, stderr=subprocess.STDOUT)
     return subprocess.Popen(command, env=env, start_new_session=True)
 
 
@@ -205,6 +216,9 @@ def generate_completions(
         if sampling_params.get("stop") is not None:
             payload["stop"] = sampling_params["stop"]
             payload["include_stop_str_in_output"] = sampling_params.get("include_stop_str_in_output", False)
+        for key in ("top_p", "top_k", "logprobs"):
+            if key in sampling_params:
+                payload[key] = sampling_params[key]
 
         response = _http_json("POST", f"{vllm_base_url}/v1/completions", payload, timeout=3600)
         choices = sorted(response["choices"], key=lambda choice: choice["index"])
@@ -213,6 +227,7 @@ def generate_completions(
                 text=choice["text"],
                 token_ids=choice.get("token_ids") or [],
                 finish_reason=choice.get("finish_reason"),
+                token_log_probs=(choice.get("logprobs") or {}).get("token_logprobs"),
             )
             for choice in choices
         )
@@ -255,7 +270,10 @@ def init_weight_sync(vllm_base_url: str, policy_device: str):
     return weight_sync_group
 
 
-def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync_group) -> None:
+def sync_policy_weights(
+    policy: torch.nn.Module, vllm_base_url: str, weight_sync_group,
+    packed: bool = True, transfer_dtype: torch.dtype | None = None,
+) -> None:
     """Copy policy weights into vLLM and invalidate caches derived from old weights."""
     from vllm.distributed.weight_transfer.nccl_engine import (
         NCCLTrainerSendWeightsArgs,
@@ -265,9 +283,9 @@ def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync
     weights = list(policy.named_parameters())
     update_info = {
         "names": [name for name, _ in weights],
-        "dtype_names": [str(tensor.dtype).split(".")[-1] for _, tensor in weights],
+        "dtype_names": [str(transfer_dtype or tensor.dtype).split(".")[-1] for _, tensor in weights],
         "shapes": [list(tensor.shape) for _, tensor in weights],
-        "packed": True,
+        "packed": packed,
     }
 
     torch.cuda.set_device(next(policy.parameters()).device)
@@ -281,10 +299,10 @@ def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync
             300,
         )
         NCCLWeightTransferEngine.trainer_send_weights(
-            iterator=iter(weights),
+            iterator=((name, tensor.detach().to(dtype=transfer_dtype or tensor.dtype)) for name, tensor in weights),
             trainer_args=NCCLTrainerSendWeightsArgs(
                 group=weight_sync_group,
-                packed=True,
+                packed=packed,
             ),
         )
         update_future.result()

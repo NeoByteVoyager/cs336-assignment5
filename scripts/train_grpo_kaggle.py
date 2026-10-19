@@ -1,15 +1,17 @@
 """Full-parameter on-policy GRPO on two GPUs, including 2 x 16 GB GPUs.
 
-Run from the repository root (no torchrun, vLLM, or flash-attn needed):
-    # Keep Kaggle's CUDA-enabled PyTorch; install only the other dependencies:
-    pip install 'transformers>=4.50,<6' accelerate 'math-verify[antlr4-13-2]>=0.7' pylatexenc matplotlib
+Run from the repository root (no torchrun or separate flash-attn install):
+    # vLLM must be installed together with its matching PyTorch dependencies.
+    python -m pip install 'vllm==0.19.1' accelerate matplotlib pylatexenc 'math-verify[antlr4-13-2]==0.7.0' 'latex2sympy2_extended==1.10.1'
     python scripts/train_grpo_kaggle.py --variant grpo --seeds 0
     python scripts/train_grpo_kaggle.py --variant all --seeds 0 1 2 3
     python scripts/train_grpo_kaggle.py --variant maxrl --seeds 0 --steps 2 --val-examples 16
     python scripts/train_grpo_kaggle.py --plot-only
 
 GPU 0 holds FP32 training parameters/gradients with FP16 autocast. AdamW's
-FP32 moments live on CPU; GPU 1 holds the FP16 rollout model and KV cache.
+FP32 moments live on CPU; GPU 1 runs a separate FP16 vLLM server by default.
+Weights are synchronized through NCCL after every optimizer step, without disk
+checkpoints. --inference-backend transformers retains the older slow fallback.
 Gradient checkpointing and physical microbatches of one bound GPU memory.
 The assignment's 32 logical microbatches of eight are subdivided without
 changing the batch of 256, normalization, or one optimizer update per rollout.
@@ -29,19 +31,24 @@ Each run has its own console/metrics/rollout logs. Use --no-save-model for logs 
 The final comparison ranks variants by mean FINAL validation reward across seeds;
 this is distinct from the best single checkpoint selected during training.
 A saved model can be loaded for inference, but cannot exactly resume training.
-Transformers generation and CPU Adam are slower than the handout's B200/vLLM
-setup; twenty full runs will generally require several Kaggle sessions.
+The default session budget is 11.5 hours, reserving time for final inspection.
+Unfinished runs are explicitly marked incomplete, not counted as full runs.
+Twenty full runs are not guaranteed to fit one session: use separate jobs and
+combine their small log directories for --plot-only. No training-state resume.
+vLLM token_entropy is sampled-token surprisal (an MC entropy estimate at T=1),
+not the full-vocabulary entropy computed by the Transformers fallback.
 """
 
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import csv
 import gc
 import json
 import math
 import os
+from itertools import groupby
 from pathlib import Path
 import random
 from statistics import mean, stdev
@@ -67,6 +74,7 @@ from cs336_alignment.onpolicy_grpo.grpo_components import (
     compute_rollout_rewards,
 )
 from cs336_alignment.onpolicy_grpo.utils import tokenize_prompt_and_output
+from cs336_alignment.vllm_utils import VLLMServer, start_server, wait_for_server
 
 
 VARIANTS = {
@@ -173,8 +181,95 @@ def read_data(path, count, seed):
     return random.Random(seed).sample(rows, count)
 
 
+def require_vllm():
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        installed = version("vllm")
+    except PackageNotFoundError as error:
+        raise RuntimeError("Install vllm==0.19.1 with its matching PyTorch dependencies before running") from error
+    if installed != "0.19.1":
+        raise RuntimeError(f"This weight-sync adapter targets vllm==0.19.1, found {installed}")
+
+
+class VLLMRollout:
+    """One server on the rollout GPU, with streamed FP16 NCCL weight updates."""
+
+    def __init__(self, policy, args, seed, run_dir):
+        require_vllm()
+        self.policy = policy
+        self.request_seed = seed
+        self.server = VLLMServer(model_id=args.model, gpu=args.rollout_gpu, seed=seed,
+                                 port=args.vllm_port, gpu_memory_utilization=args.vllm_memory_fraction)
+        log_path = Path(run_dir) / "vllm_server.log"
+        try:
+            self.server.process = start_server(
+                args.model, self.server.host, self.server.port, args.rollout_gpu, seed, "auto", "INFO",
+                args.vllm_memory_fraction, dtype="float16", log_path=str(log_path),
+                extra_args=("--max-model-len", str(args.vllm_max_model_len),
+                            "--max-num-seqs", str(args.vllm_max_num_seqs),
+                            "--max-num-batched-tokens", str(args.vllm_max_batched_tokens),
+                            "--generation-config", "vllm", "--enforce-eager"),
+            )
+            wait_for_server(self.server.base_url, self.server.process, 900)
+            self.server.init_weight_sync(str(next(policy.parameters()).device))
+        except BaseException:
+            self.close()
+            print(f"vLLM startup failed; inspect {log_path}", file=sys.stderr)
+            raise
+
+    def close(self):
+        self.server.stop()
+        self.server.weight_sync_group = None
+
+    def sync(self, policy):
+        from cs336_alignment.vllm_utils import sync_policy_weights
+        self.policy = policy
+        # Avoid full-model staging buffers while the inference GPU holds KV cache.
+        sync_policy_weights(policy, self.server.base_url, self.server.weight_sync_group,
+                            packed=False, transfer_dtype=torch.float16)
+
+    def generate(self, tokenizer, prompts, args, collect_entropy):
+        groups = [(prompt, len(list(items))) for prompt, items in groupby(prompts)]
+        counts = {count for _, count in groups}
+        n = counts.pop() if len(counts) == 1 else 1
+        request_prompts = [prompt for prompt, _ in groups] if n > 1 else prompts
+        params = dict(temperature=1.0, top_p=1.0, top_k=-1, max_tokens=args.max_new_tokens,
+                      n=n, seed=self.request_seed)
+        self.request_seed += 1
+        if args.prompt != "question_only":
+            params.update(stop=["</answer>"], include_stop_str_in_output=True)
+        if collect_entropy:
+            params["logprobs"] = 0
+        # n=group_size samples independently within a request. Sending repeated
+        # identical prompts with the same explicit seed would collapse the group.
+        completions = self.server.generate_completions(
+            request_prompts, params, batch_size=args.vllm_request_batch_size)
+        if len(completions) != len(prompts):
+            raise RuntimeError(f"vLLM returned {len(completions)} responses for {len(prompts)} prompts")
+        responses = [item.text for item in completions]
+        lengths = [len(tokenizer.encode(text, add_special_tokens=False)) for text in responses]
+        log_probs = [value for item in completions for value in (item.token_log_probs or []) if value is not None]
+        if collect_entropy and not log_probs:
+            raise RuntimeError("vLLM did not return the requested sampled token log-probabilities")
+        entropy = -sum(log_probs) / len(log_probs) if log_probs else None
+        return responses, lengths, entropy
+
+    def save_pretrained(self, directory, **kwargs):
+        # Export from the HF policy, not a second resident GPU inference model.
+        state = {name: tensor.detach().to(device="cpu", dtype=torch.float16) if tensor.is_floating_point()
+                 else tensor.detach().cpu() for name, tensor in self.policy.state_dict().items()}
+        self.policy.save_pretrained(directory, state_dict=state, **kwargs)
+        path = Path(directory) / "config.json"
+        config = json.loads(path.read_text())
+        config.update(dtype="float16", torch_dtype="float16")
+        path.write_text(json.dumps(config, indent=2))
+
+
 @torch.no_grad()
 def sync_weights(policy, rollout_model):
+    if isinstance(rollout_model, VLLMRollout):
+        rollout_model.sync(policy)
+        return
     source = dict(policy.named_parameters())
     for name, parameter in rollout_model.named_parameters():
         parameter.copy_(source[name])
@@ -215,6 +310,8 @@ class RolloutEntropy(LogitsProcessor):
 
 @torch.inference_mode()
 def generate(model, tokenizer, prompts, args, collect_entropy=False):
+    if isinstance(model, VLLMRollout):
+        return model.generate(tokenizer, prompts, args, collect_entropy)
     responses, lengths = [], []
     entropy_sum, token_count = 0.0, 0
     device = next(model.parameters()).device
@@ -333,13 +430,22 @@ def inspect_test_samples(model, tokenizer, rows, template, reward_fn, args, run_
     """Inspect fixed test questions without consuming the training RNG stream."""
     print(f"\n[{phase}] Generating answers for {len(rows)} fixed test questions", flush=True)
     prompts = [template.format(question=row["question"]) for row in rows]
-    device = next(model.parameters()).device
+    is_vllm = isinstance(model, VLLMRollout)
+    device = torch.device("cpu") if is_vllm else next(model.parameters()).device
     with torch.random.fork_rng(devices=[device.index] if device.type == "cuda" else []):
         torch.random.default_generator.manual_seed(args.data_seed)
         if device.type == "cuda":
             with torch.cuda.device(device):
                 torch.cuda.manual_seed(args.data_seed)
-        responses, lengths, _ = generate(model, tokenizer, prompts, args)
+        if is_vllm:
+            previous_seed = model.request_seed
+            model.request_seed = args.data_seed
+            try:
+                responses, lengths, _ = generate(model, tokenizer, prompts, args)
+            finally:
+                model.request_seed = previous_seed
+        else:
+            responses, lengths, _ = generate(model, tokenizer, prompts, args)
     total_reward, total_format = 0.0, 0.0
     for index, (row, prompt, response, length) in enumerate(zip(rows, prompts, responses, lengths), 1):
         truth = row["answer"].split("####")[-1].strip()
@@ -360,7 +466,8 @@ def inspect_test_samples(model, tokenizer, rows, template, reward_fn, args, run_
     return metrics
 
 
-def run(args, name, seed):
+def run(args, name, seed, resources, deadline):
+    run_started = time.monotonic()
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -393,11 +500,15 @@ def run(args, name, seed):
     scaler = torch.amp.GradScaler("cuda")
     (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    rollout_model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.float16, attn_implementation="sdpa",
-        device_map={"": f"cuda:{args.rollout_gpu}"},
-    ).eval()
-    rollout_model.requires_grad_(False)
+    if args.inference_backend == "vllm":
+        rollout_model = VLLMRollout(policy, args, seed, run_dir)
+        resources.callback(rollout_model.close)
+    else:
+        rollout_model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=torch.float16, attn_implementation="sdpa",
+            device_map={"": f"cuda:{args.rollout_gpu}"},
+        ).eval()
+        rollout_model.requires_grad_(False)
     sync_weights(policy, rollout_model)
     wandb_run = None
     if args.wandb_project:
@@ -410,30 +521,47 @@ def run(args, name, seed):
         if wandb_run:
             wandb_run.log(record, step=record["step"])
 
+    phase_started = time.monotonic()
     before = inspect_test_samples(rollout_model, tokenizer, inspection_rows, template,
                                   reward_fn, args, run_dir, "before_rl")
+    inspection_seconds = time.monotonic() - phase_started
     (run_dir / "test_inspection_summary.json").write_text(json.dumps({"before_rl": before}, indent=2))
     print(f"Initial validation: {len(val_rows)} examples", flush=True)
+    phase_started = time.monotonic()
     metrics, samples = evaluate(rollout_model, tokenizer, val_rows, template, reward_fn, args)
     log({"step": 0, **metrics})
     write_jsonl(run_dir / "val_rollouts.jsonl", dict(step=0, samples=samples))
+    validation_seconds = time.monotonic() - phase_started
+    setup_seconds = time.monotonic() - run_started
+    durations = []
     for step in range(1, args.steps + 1):
         started = time.monotonic()
         torch.cuda.reset_peak_memory_stats(args.train_gpu)
-        torch.cuda.reset_peak_memory_stats(args.rollout_gpu)
+        if args.inference_backend == "transformers":
+            torch.cuda.reset_peak_memory_stats(args.rollout_gpu)
         rows = sampler.sample(train_rows, args.rollout_batch_size // args.group_size)
         prompts = [template.format(question=row["question"]) for row in rows for _ in range(args.group_size)]
         truths = [row["answer"].split("####")[-1].strip() for row in rows for _ in range(args.group_size)]
         # GPU 1 was synchronized after the previous optimizer step (or on load).
         print(f"Step {step}/{args.steps}: generating {len(prompts)} rollouts", flush=True)
         responses, lengths, entropy = generate(rollout_model, tokenizer, prompts, args, collect_entropy=True)
+        rollout_seconds = time.monotonic() - started
         print(f"Step {step}/{args.steps}: training", flush=True)
+        phase_started = time.monotonic()
         metadata = train_batch(policy, tokenizer, optimizer, scaler, prompts, responses, truths, reward_fn, args, variant)
+        train_seconds = time.monotonic() - phase_started
         sync_weights(policy, rollout_model)
+        reserve = max(300.0, 1.5 * (inspection_seconds + validation_seconds))
+        next_step_seconds = max(durations[-10:], default=time.monotonic() - started)
+        stop_for_budget = time.monotonic() + reserve + next_step_seconds >= deadline
         record = dict(step=step, **metadata, token_entropy=entropy, train_response_length=sum(lengths) / len(lengths),
+                      token_entropy_estimator="sampled_surprisal" if args.inference_backend == "vllm" else "full_vocabulary",
+                      rollout_seconds=rollout_seconds, train_seconds=train_seconds,
+                      generated_tokens_per_second=sum(lengths) / max(rollout_seconds, 1e-6),
                       train_peak_gb=torch.cuda.max_memory_allocated(args.train_gpu) / 2**30,
-                      rollout_peak_gb=torch.cuda.max_memory_allocated(args.rollout_gpu) / 2**30)
-        if step % args.val_every == 0 or step == args.steps:
+                      rollout_peak_gb=(torch.cuda.max_memory_allocated(args.rollout_gpu) / 2**30
+                                       if args.inference_backend == "transformers" else None))
+        if step % args.val_every == 0 or step == args.steps or stop_for_budget:
             print(f"Step {step}/{args.steps}: validating", flush=True)
             metrics, samples = evaluate(rollout_model, tokenizer, val_rows, template, reward_fn, args)
             record.update(metrics)
@@ -449,7 +577,15 @@ def run(args, name, seed):
                 dict(prompt=p, response=r, ground_truth=t, **reward_fn(r, t))
                 for p, r, t in zip(prompts, responses, truths)]))
         record["step_seconds"] = time.monotonic() - started
+        durations.append(record["step_seconds"])
+        record["estimated_remaining_seconds"] = mean(durations[-10:]) * (args.steps - step) + inspection_seconds
+        record["estimated_200_step_run_hours"] = (setup_seconds + mean(durations[-10:]) * 200 + inspection_seconds) / 3600
+        record["time_budget_stop"] = stop_for_budget and step < args.steps
         log(record)
+        if stop_for_budget and step < args.steps:
+            print(f"Session budget reached at step {step}/{args.steps}; this run is INCOMPLETE. "
+                  "Finishing test inspection and keeping the best weights/logs.", flush=True)
+            break
     after = inspect_test_samples(rollout_model, tokenizer, inspection_rows, template,
                                  reward_fn, args, run_dir, "after_rl")
     comparison = dict(before_rl=before, after_rl=after, reward_change=after["mean_reward"] - before["mean_reward"])
@@ -457,6 +593,10 @@ def run(args, name, seed):
     print(f"Test inspection before/after: {json.dumps(comparison)}", flush=True)
     if wandb_run:
         wandb_run.finish()
+    result = dict(completed=step == args.steps, steps_completed=step, requested_steps=args.steps,
+                  wall_seconds=time.monotonic() - run_started)
+    (run_dir / "run_result.json").write_text(json.dumps(result, indent=2))
+    return result
 
 
 def write_comparison(output_dir, runs):
@@ -583,6 +723,16 @@ def parse_args(argv=None):
     parser.add_argument("--variant", choices=[*VARIANTS, "all"], default="grpo")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
     parser.add_argument("--model", default="allenai/OLMo-2-0425-1B")
+    parser.add_argument("--inference-backend", choices=["vllm", "transformers"], default="vllm")
+    parser.add_argument("--vllm-port", type=int, default=8000)
+    parser.add_argument("--vllm-memory-fraction", type=float, default=0.75)
+    parser.add_argument("--vllm-max-model-len", type=int, default=2048)
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=32)
+    parser.add_argument("--vllm-max-batched-tokens", type=int, default=4096)
+    parser.add_argument("--vllm-request-batch-size", type=int, default=256)
+    parser.add_argument("--max-hours", type=float, default=11.5,
+                        help="Whole-process budget including all runs; leaves margin under Kaggle's 12h limit")
+    parser.add_argument("--skip-completed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prompt", choices=["r1_zero", "r1_zero_three_shot_gsm8k", "question_only"], default="r1_zero")
     parser.add_argument("--train-data", default=str(ROOT / "data/gsm8k/train.jsonl"))
     parser.add_argument("--val-data", default=str(ROOT / "data/gsm8k/test.jsonl"))
@@ -627,10 +777,19 @@ def parse_args(argv=None):
         parser.error("Training dataset must have enough distinct prompts for one rollout batch")
     if args.learning_rate <= 0 or args.max_grad_norm <= 0:
         parser.error("Learning rate and grad norm must be positive")
+    if not 0 < args.max_hours < 12:
+        parser.error("--max-hours must be positive and less than 12")
+    if not 0 < args.vllm_memory_fraction < 1:
+        parser.error("--vllm-memory-fraction must be between zero and one")
+    if min(args.vllm_max_num_seqs, args.vllm_max_batched_tokens, args.vllm_request_batch_size) <= 0:
+        parser.error("vLLM batching limits must be positive")
+    if args.vllm_max_model_len <= args.max_new_tokens:
+        parser.error("vLLM context length must leave room for the prompt")
     return args
 
 
 def main():
+    session_started = time.monotonic()
     args = parse_args()
     if args.plot_only:
         plot_results(args.output_dir)
@@ -643,25 +802,50 @@ def main():
     for gpu in (args.train_gpu, args.rollout_gpu):
         props = torch.cuda.get_device_properties(gpu)
         print(f"GPU {gpu}: {props.name}, {props.total_memory / 2**30:.1f} GiB", flush=True)
-    print("FP32 parameters + FP16 AMP; CPU AdamW; streaming entropy covers all training rollouts.", flush=True)
+    print(f"Backend={args.inference_backend}; FP32 train parameters + FP16 AMP; CPU AdamW; "
+          f"session budget={args.max_hours} hours.", flush=True)
+    if args.inference_backend == "vllm":
+        require_vllm()
+        print("token_entropy is sampled-token surprisal, an MC entropy estimate at temperature 1.", flush=True)
+    deadline = session_started + args.max_hours * 3600
     names = list(VARIANTS) if args.variant == "all" else [args.variant]
+    last_run_seconds = None
     try:
         for name in names:
             for seed in args.seeds:
                 run_dir = Path(args.output_dir) / f"{args.prompt}_{name}_seed{seed}"
                 run_dir.mkdir(parents=True, exist_ok=True)
                 if (run_dir / "metrics.jsonl").exists():
-                    raise ValueError(f"{run_dir} already has metrics; use a new --output-dir")
-                with console_log(run_dir / "console.log"):
+                    result_path = run_dir / "run_result.json"
+                    if args.skip_completed and result_path.exists() and json.loads(result_path.read_text())["completed"]:
+                        saved = json.loads((run_dir / "config.json").read_text())
+                        for key in ("model", "prompt", "steps", "learning_rate", "group_size", "rollout_batch_size",
+                                    "max_new_tokens", "data_seed", "train_examples", "val_examples", "inference_backend"):
+                            if saved.get(key) != getattr(args, key):
+                                raise ValueError(f"Completed run configuration differs ({key}); use a new --output-dir")
+                        print(f"Skipping completed run {run_dir.name}", flush=True)
+                        continue
+                    raise ValueError(f"{run_dir} has an incomplete run; optimizer state was not saved. "
+                                     "Restart that variant/seed in a new --output-dir.")
+                if time.monotonic() + (1.15 * last_run_seconds if last_run_seconds else 600) >= deadline:
+                    print("Not enough session budget to start another run; generate comparison and exit.", flush=True)
+                    plot_results(args.output_dir)
+                    return
+                with console_log(run_dir / "console.log"), ExitStack() as resources:
                     print(f"Starting {name}, seed={seed}", flush=True)
-                    run(args, name, seed)
+                    result = run(args, name, seed, resources, deadline)
+                last_run_seconds = result["wall_seconds"]
                 gc.collect()
-                for gpu in (args.train_gpu, args.rollout_gpu):
+                for gpu in ((args.train_gpu,) if args.inference_backend == "vllm" else (args.train_gpu, args.rollout_gpu)):
                     with torch.cuda.device(gpu):
                         torch.cuda.empty_cache()
                 plot_results(args.output_dir)
+                if not result["completed"]:
+                    return
+        plot_results(args.output_dir)
     except torch.cuda.OutOfMemoryError:
-        print("CUDA OOM: keep --microbatch-size 1 and lower --generate-batch-size to 1. "
+        print("CUDA OOM: keep --microbatch-size 1. For vLLM lower --vllm-max-num-seqs to 16; "
+              "for Transformers lower --generate-batch-size to 1. "
               "Keep rollout batch/group size and generation length fixed for comparable experiments.", file=sys.stderr)
         raise
 
