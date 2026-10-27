@@ -15,6 +15,10 @@ from cs336_alignment.onpolicy_grpo.grpo_components import (
     aggregate_loss_across_microbatch,
     grpo_train_step
 )
+from cs336_alignment.sft.parse_mmlu_response import parse_mmlu_response
+
+
+
 def run_tokenize_prompt_and_output(
     prompt_strs: list[str],
     output_strs: list[str],
@@ -411,7 +415,7 @@ def run_parse_mmlu_response(
         str (one of "A", "B", "C", or "D") if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    return parse_mmlu_response(mmlu_example, model_output)
 
 
 def run_parse_gsm8k_response(
