@@ -16,7 +16,7 @@ from cs336_alignment.onpolicy_grpo.grpo_components import (
     grpo_train_step
 )
 from cs336_alignment.sft.parse_mmlu_response import parse_mmlu_response
-
+from cs336_alignment.sft.data_loader import SFTDataset, get_batches
 
 
 def run_tokenize_prompt_and_output(
@@ -366,7 +366,7 @@ def get_packed_sft_dataset(
         "input_ids" contains the token IDs for the language modeling inputs, and "labels" contains
         the token IDs for the language modeling labels.
     """
-    raise NotImplementedError
+    return SFTDataset(tokenizer, dataset_path, seq_length, shuffle)
 
 
 def run_iterate_batches(
@@ -389,7 +389,7 @@ def run_iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    raise NotImplementedError
+    return get_batches(dataset, batch_size, shuffle)
 
 
 def run_parse_mmlu_response(
